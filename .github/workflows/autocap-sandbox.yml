@@ -1,0 +1,177 @@
+name: NAMI AutoCap Ephemeral Windows Sandbox
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  EXPECTED_ARCHIVE_SHA: b307a74f9258f37b54c5ce3a68b750230a88c2fc2c76ed4708fa550d33085f34
+  EXPECTED_AUTOCAP_SHA: 86419372ec32323519eccf116f7dc074006a2d5a71fbbd02661a2658ec73e78c
+  HF_REPO: Cthuunghiacity/nami-autopilot-state
+  HF_FILE: tools/autocap/b307a74f9258f37b/id_195_AutoCapv1.2.zip
+
+jobs:
+  sandbox:
+    runs-on: windows-latest
+    timeout-minutes: 18
+    steps:
+      - name: Prepare isolated paths
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\nami-autocap" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\nami-report" | Out-Null
+
+      - name: Download source from private NAMI storage
+        shell: pwsh
+        env:
+          HF_TOKEN: ${{ secrets.NAMI_HF_READ_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $headers = @{ Authorization = "Bearer $env:HF_TOKEN" }
+          $url = "https://huggingface.co/datasets/$env:HF_REPO/resolve/main/$env:HF_FILE?download=true"
+          $zip = "$env:RUNNER_TEMP\nami-autocap\source.zip"
+          Invoke-WebRequest -Uri $url -Headers $headers -OutFile $zip -UseBasicParsing
+          $sha = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
+          if ($sha -ne $env:EXPECTED_ARCHIVE_SHA) { throw "ARCHIVE_SHA_MISMATCH=$sha" }
+          "ARCHIVE_SHA256=$sha" | Out-File "$env:RUNNER_TEMP\nami-report\preflight.txt"
+          Remove-Item Env:HF_TOKEN -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force "$env:USERPROFILE\.cache\huggingface" -ErrorAction SilentlyContinue
+
+      - name: Extract portable package and verify executable
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = "$env:RUNNER_TEMP\nami-autocap"
+          $outer = "$root\outer"
+          $portable = "$root\portable"
+          Expand-Archive -LiteralPath "$root\source.zip" -DestinationPath $outer -Force
+          $nested = Get-ChildItem $outer -Recurse -File -Filter *.zip | Where-Object {
+            try {
+              Add-Type -AssemblyName System.IO.Compression.FileSystem
+              $z=[IO.Compression.ZipFile]::OpenRead($_.FullName)
+              $found=($z.Entries.FullName -match '(^|[/\\])AutoCap\.exe$').Count -gt 0
+              $z.Dispose(); $found
+            } catch { $false }
+          } | Select-Object -First 1
+          if (-not $nested) { throw 'PORTABLE_NESTED_ARCHIVE_NOT_FOUND' }
+          Expand-Archive -LiteralPath $nested.FullName -DestinationPath $portable -Force
+          $exe = Get-ChildItem $portable -Recurse -File -Filter AutoCap.exe
+          if ($exe.Count -ne 1) { throw "AUTOCAP_EXE_COUNT=$($exe.Count)" }
+          $sha = (Get-FileHash -Algorithm SHA256 $exe.FullName).Hash.ToLowerInvariant()
+          if ($sha -ne $env:EXPECTED_AUTOCAP_SHA) { throw "AUTOCAP_SHA_MISMATCH=$sha" }
+          "AUTOCAP_EXE=$($exe.FullName)" | Out-File "$env:RUNNER_TEMP\nami-report\paths.txt"
+          "AUTOCAP_SHA256=$sha" | Add-Content "$env:RUNNER_TEMP\nami-report\preflight.txt"
+          Get-ChildItem $portable -Recurse -File | Select-Object FullName,Length | ConvertTo-Json -Depth 3 | Out-File "$env:RUNNER_TEMP\nami-report\inventory.json" -Encoding utf8
+
+      - name: Microsoft Defender scan
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $portable = "$env:RUNNER_TEMP\nami-autocap\portable"
+          $mp = "$env:ProgramFiles\Windows Defender\MpCmdRun.exe"
+          if (-not (Test-Path $mp)) { throw 'WINDOWS_DEFENDER_NOT_AVAILABLE' }
+          & $mp -Scan -ScanType 3 -File $portable 2>&1 | Tee-Object "$env:RUNNER_TEMP\nami-report\defender.txt"
+          $code = $LASTEXITCODE
+          "DEFENDER_EXIT_CODE=$code" | Add-Content "$env:RUNNER_TEMP\nami-report\preflight.txt"
+          if ($code -ne 0) { throw "DEFENDER_SCAN_NOT_CLEAN_EXIT=$code" }
+
+      - name: Restricted launch and behavior capture
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $report = "$env:RUNNER_TEMP\nami-report"
+          $portable = "$env:RUNNER_TEMP\nami-autocap\portable"
+          $exe = (Get-ChildItem $portable -Recurse -File -Filter AutoCap.exe | Select-Object -First 1).FullName
+
+          # Block outbound network for every executable shipped in the portable tree.
+          $rules = @()
+          Get-ChildItem $portable -Recurse -File -Filter *.exe | ForEach-Object {
+            $name = "NAMI-V146E-$([Guid]::NewGuid().ToString('N'))"
+            New-NetFirewallRule -DisplayName $name -Direction Outbound -Action Block -Program $_.FullName -Profile Any | Out-Null
+            $rules += $name
+          }
+          if ($rules.Count -lt 1) { throw 'NO_FIREWALL_RULE_CREATED' }
+
+          $probeExe = (Get-ChildItem $portable -Recurse -File -Filter *.exe | Select-Object -First 1).FullName
+          $matched = Get-NetFirewallApplicationFilter | Where-Object Program -eq $probeExe
+          if (-not $matched) { throw 'FIREWALL_PROGRAM_RULE_NOT_PROVEN' }
+
+          # Remove common credentials from this process environment before launch.
+          'HF_TOKEN','HUGGINGFACE_HUB_TOKEN','GITHUB_TOKEN','GH_TOKEN','ACTIONS_RUNTIME_TOKEN','ACTIONS_ID_TOKEN_REQUEST_TOKEN','ACTIONS_ID_TOKEN_REQUEST_URL' |
+            ForEach-Object { Remove-Item "Env:$_" -ErrorAction SilentlyContinue }
+
+          $before = Get-ChildItem $portable -Recurse -File | Select-Object FullName,Length,LastWriteTimeUtc
+          $start = Get-Date
+          $attempted = $false; $started = $false; $exitCode = $null; $errorText = $null
+          try {
+            $attempted = $true
+            $p = Start-Process -FilePath $exe -WorkingDirectory (Split-Path $exe) -PassThru
+            Start-Sleep -Seconds 4
+            $started = -not $p.HasExited
+            $samples = @()
+            1..6 | ForEach-Object {
+              $samples += Get-Process | Where-Object { $_.Path -and $_.Path.StartsWith($portable,[StringComparison]::OrdinalIgnoreCase) } |
+                Select-Object Id,ProcessName,Path,CPU,StartTime
+              Start-Sleep -Seconds 3
+            }
+            $samples | Sort-Object Id -Unique | ConvertTo-Json -Depth 4 | Out-File "$report\processes.json" -Encoding utf8
+            if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue; Start-Sleep 2 }
+            try { $exitCode = $p.ExitCode } catch {}
+          } catch {
+            $errorText = $_.Exception.ToString()
+          } finally {
+            Get-Process | Where-Object { $_.Path -and $_.Path.StartsWith($portable,[StringComparison]::OrdinalIgnoreCase) } |
+              Stop-Process -Force -ErrorAction SilentlyContinue
+            foreach ($r in $rules) { Remove-NetFirewallRule -DisplayName $r -ErrorAction SilentlyContinue }
+          }
+
+          $after = Get-ChildItem $portable -Recurse -File | Select-Object FullName,Length,LastWriteTimeUtc
+          Compare-Object $before $after -Property FullName,Length,LastWriteTimeUtc | ConvertTo-Json -Depth 4 |
+            Out-File "$report\file_changes.json" -Encoding utf8
+          Get-NetTCPConnection -ErrorAction SilentlyContinue | Where-Object OwningProcess -gt 0 |
+            Select-Object State,LocalAddress,LocalPort,RemoteAddress,RemotePort,OwningProcess |
+            ConvertTo-Json -Depth 4 | Out-File "$report\tcp_snapshot_after.json" -Encoding utf8
+
+          $result = [ordered]@{
+            status = if ($attempted -and ($started -or $exitCode -ne $null)) {'NAMI_AUTOCAP_GITHUB_EPHEMERAL_SANDBOX_PASS'} else {'NAMI_AUTOCAP_GITHUB_EPHEMERAL_SANDBOX_FAILED'}
+            archive_sha256_verified = $true
+            autocap_sha256_verified = $true
+            defender_scan_exit_code = 0
+            firewall_program_rules_created = $rules.Count
+            firewall_program_rule_proven = $true
+            autocap_execution_attempted = $attempted
+            autocap_process_started = $started
+            autocap_exit_code = $exitCode
+            launch_error = $errorText
+            setup_exe_executed = $false
+            source_archive_executed = $false
+            secrets_removed_before_launch = $true
+            normal_execution_ready = $false
+            malware_free_claimed = $false
+            runner_ephemeral = $true
+            paid_service_authorized = $false
+            completed_at = (Get-Date).ToUniversalTime().ToString('o')
+          }
+          $result | ConvertTo-Json -Depth 5 | Out-File "$report\result.json" -Encoding utf8
+          Get-Content "$report\result.json"
+
+      - name: Delete downloaded binaries before artifact upload
+        if: always()
+        shell: pwsh
+        run: |
+          Get-Process | Where-Object { $_.Path -and $_.Path.StartsWith("$env:RUNNER_TEMP\nami-autocap",[StringComparison]::OrdinalIgnoreCase) } |
+            Stop-Process -Force -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force "$env:RUNNER_TEMP\nami-autocap" -ErrorAction SilentlyContinue
+          if (Test-Path "$env:RUNNER_TEMP\nami-autocap") { throw 'BINARY_CLEANUP_FAILED' }
+
+      - name: Upload reports only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nami-v146e-autocap-sandbox-report
+          path: ${{ runner.temp }}\nami-report\**
+          if-no-files-found: warn
+          retention-days: 1
