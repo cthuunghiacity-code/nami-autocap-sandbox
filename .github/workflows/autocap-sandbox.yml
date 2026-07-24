@@ -1122,6 +1122,334 @@ jobs:
             "CREDENTIAL_VALUES_EXPORTED=false"
           ) | Out-File "$reportDir\v146j-summary.txt" -Append
 
+      - name: Identify AutoCap compiler and packer statically
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+
+          $reportDir = "$env:RUNNER_TEMP\nami-report"
+          $auditDir = "$env:RUNNER_TEMP\nami-v146k"
+          $dieDir = "$auditDir\die"
+
+          New-Item -ItemType Directory -Force -Path $auditDir |
+            Out-Null
+
+          New-Item -ItemType Directory -Force -Path $dieDir |
+            Out-Null
+
+          Remove-Item Env:HF_TOKEN -ErrorAction SilentlyContinue
+          Remove-Item Env:HF_TOKEN_B64 -ErrorAction SilentlyContinue
+          Remove-Item Env:NAMI_HF_READ_TOKEN -ErrorAction SilentlyContinue
+          Remove-Item Env:GITHUB_TOKEN -ErrorAction SilentlyContinue
+
+          $exe = $env:AUTOCAP_EXE
+
+          @(
+            "VERSION=NAMI_V146K_AUTOCAP_PACKER_IDENTIFICATION"
+            "AUTOCAP_EXE=$exe"
+            "STATIC_ANALYSIS_ONLY=true"
+            "AUTOCAP_EXECUTED_IN_THIS_STEP=false"
+            "PRIVATE_USER_VIDEO_USED=false"
+          ) | Out-File "$reportDir\v146k-summary.txt"
+
+          python -m pip install `
+            --disable-pip-version-check `
+            --no-input `
+            pefile 2>&1 |
+            Out-File "$reportDir\v146k-pefile-install.txt"
+
+          $releaseApi = `
+            "https://api.github.com/repos/horsicq/Detect-It-Easy/releases/latest"
+
+          try {
+            $release = Invoke-RestMethod `
+              -Uri $releaseApi `
+              -Headers @{
+                "User-Agent" = "NAMI-V146K"
+              }
+
+            $asset = $release.assets |
+              Where-Object {
+                $_.name -match '(?i)win.*(zip|7z)$' -and
+                $_.name -notmatch '(?i)installer|setup'
+              } |
+              Select-Object -First 1
+
+            if (-not $asset) {
+              $asset = $release.assets |
+                Where-Object {
+                  $_.name -match '(?i)(zip|7z)$'
+                } |
+                Select-Object -First 1
+            }
+
+            if (-not $asset) {
+              throw "DIE_RELEASE_ARCHIVE_NOT_FOUND"
+            }
+
+            "DIE_RELEASE_TAG=$($release.tag_name)" |
+              Out-File "$reportDir\v146k-summary.txt" -Append
+
+            "DIE_ASSET_NAME=$($asset.name)" |
+              Out-File "$reportDir\v146k-summary.txt" -Append
+
+            $archive = Join-Path $auditDir $asset.name
+
+            Invoke-WebRequest `
+              -Uri $asset.browser_download_url `
+              -OutFile $archive `
+              -UseBasicParsing
+
+            $sevenZip = "C:\Program Files\7-Zip\7z.exe"
+
+            if (-not (Test-Path $sevenZip)) {
+              throw "SEVEN_ZIP_NOT_FOUND"
+            }
+
+            & $sevenZip `
+              x `
+              "-o$dieDir" `
+              -y `
+              $archive 2>&1 |
+              Out-File "$reportDir\v146k-die-extract.txt"
+
+            $diec = Get-ChildItem `
+              -Path $dieDir `
+              -Recurse `
+              -File `
+              -Filter "diec.exe" |
+              Select-Object -First 1
+
+            if (-not $diec) {
+              throw "DIEC_EXE_NOT_FOUND"
+            }
+
+            "DIEC_PATH=$($diec.FullName)" |
+              Out-File "$reportDir\v146k-summary.txt" -Append
+
+            & $diec.FullName `
+              -j `
+              $exe 2>&1 |
+              Out-File `
+                "$reportDir\detect-it-easy.json" `
+                -Encoding UTF8
+
+            $dieExit = $LASTEXITCODE
+
+            "DIEC_EXIT_CODE=$dieExit" |
+              Out-File "$reportDir\v146k-summary.txt" -Append
+          }
+          catch {
+            "DIE_AUDIT_ERROR=$($_.Exception.Message)" |
+              Out-File "$reportDir\v146k-summary.txt" -Append
+          }
+
+          $pythonAudit = @'
+import json
+import math
+import os
+import sys
+
+import pefile
+
+exe = sys.argv[1]
+report_path = sys.argv[2]
+
+pe = pefile.PE(exe, fast_load=False)
+
+def entropy(data: bytes) -> float:
+    if not data:
+        return 0.0
+
+    counts = [0] * 256
+    for value in data:
+        counts[value] += 1
+
+    total = len(data)
+    result = 0.0
+
+    for count in counts:
+        if count:
+            probability = count / total
+            result -= probability * math.log2(probability)
+
+    return result
+
+result = {
+    "machine": hex(pe.FILE_HEADER.Machine),
+    "number_of_sections": pe.FILE_HEADER.NumberOfSections,
+    "timestamp": pe.FILE_HEADER.TimeDateStamp,
+    "characteristics": hex(pe.FILE_HEADER.Characteristics),
+    "entry_point_rva": hex(pe.OPTIONAL_HEADER.AddressOfEntryPoint),
+    "image_base": hex(pe.OPTIONAL_HEADER.ImageBase),
+    "subsystem": pe.OPTIONAL_HEADER.Subsystem,
+    "dll_characteristics": hex(pe.OPTIONAL_HEADER.DllCharacteristics),
+    "sections": [],
+    "imports": {},
+    "exports": [],
+    "resources": [],
+    "overlay": {},
+}
+
+for section in pe.sections:
+    name = section.Name.rstrip(b"\x00").decode(
+        "utf-8",
+        errors="replace",
+    )
+
+    raw = section.get_data()
+
+    result["sections"].append({
+        "name": name,
+        "virtual_address": hex(section.VirtualAddress),
+        "virtual_size": section.Misc_VirtualSize,
+        "raw_size": section.SizeOfRawData,
+        "entropy": round(entropy(raw), 4),
+        "characteristics": hex(section.Characteristics),
+    })
+
+if hasattr(pe, "DIRECTORY_ENTRY_IMPORT"):
+    for entry in pe.DIRECTORY_ENTRY_IMPORT:
+        dll = entry.dll.decode("utf-8", errors="replace")
+        names = []
+
+        for imported in entry.imports:
+            if imported.name:
+                names.append(
+                    imported.name.decode(
+                        "utf-8",
+                        errors="replace",
+                    )
+                )
+            else:
+                names.append(f"ordinal:{imported.ordinal}")
+
+        result["imports"][dll] = names
+
+if hasattr(pe, "DIRECTORY_ENTRY_EXPORT"):
+    for symbol in pe.DIRECTORY_ENTRY_EXPORT.symbols:
+        if symbol.name:
+            result["exports"].append(
+                symbol.name.decode(
+                    "utf-8",
+                    errors="replace",
+                )
+            )
+
+if hasattr(pe, "DIRECTORY_ENTRY_RESOURCE"):
+    for resource_type in pe.DIRECTORY_ENTRY_RESOURCE.entries:
+        type_name = (
+            str(resource_type.name)
+            if resource_type.name
+            else str(resource_type.struct.Id)
+        )
+        result["resources"].append(type_name)
+
+overlay_offset = pe.get_overlay_data_start_offset()
+
+if overlay_offset is not None:
+    file_size = os.path.getsize(exe)
+    result["overlay"] = {
+        "offset": overlay_offset,
+        "size": file_size - overlay_offset,
+    }
+else:
+    result["overlay"] = {
+        "offset": None,
+        "size": 0,
+    }
+
+with open(report_path, "w", encoding="utf-8") as handle:
+    json.dump(
+        result,
+        handle,
+        ensure_ascii=False,
+        indent=2,
+    )
+'@
+
+          $pythonPath = Join-Path $auditDir "pe_audit.py"
+
+          Set-Content `
+            -Path $pythonPath `
+            -Value $pythonAudit `
+            -Encoding UTF8
+
+          python `
+            $pythonPath `
+            $exe `
+            "$reportDir\pe-structure.json"
+
+          if ($LASTEXITCODE -eq 0) {
+            "PEFILE_AUDIT=PASS" |
+              Out-File "$reportDir\v146k-summary.txt" -Append
+          }
+          else {
+            "PEFILE_AUDIT=FAIL_EXIT_$LASTEXITCODE" |
+              Out-File "$reportDir\v146k-summary.txt" -Append
+          }
+
+          try {
+            $bytes = [System.IO.File]::ReadAllBytes($exe)
+            $ascii = [System.Text.Encoding]::ASCII.GetString($bytes)
+            $unicode = [System.Text.Encoding]::Unicode.GetString($bytes)
+
+            $patterns = @(
+              "Nuitka"
+              "PyInstaller"
+              "cx_Freeze"
+              "py2exe"
+              "Python3"
+              "python3"
+              "UPX!"
+              "Themida"
+              "VMProtect"
+              "Enigma"
+              "NSIS"
+              "Inno Setup"
+              "Electron"
+              "Qt5"
+              "Qt6"
+              "customtkinter"
+              "_MEIPASS"
+              "python3.dll"
+              "python312.dll"
+              "python311.dll"
+              "python310.dll"
+            )
+
+            foreach ($pattern in $patterns) {
+              $found = (
+                $ascii.IndexOf(
+                  $pattern,
+                  [System.StringComparison]::OrdinalIgnoreCase
+                ) -ge 0
+              ) -or (
+                $unicode.IndexOf(
+                  $pattern,
+                  [System.StringComparison]::OrdinalIgnoreCase
+                ) -ge 0
+              )
+
+              "MARKER=$pattern FOUND=$found" |
+                Out-File `
+                  "$reportDir\packer-marker-scan.txt" `
+                  -Append
+            }
+          }
+          catch {
+            "MARKER_SCAN_ERROR=$($_.Exception.Message)" |
+              Out-File `
+                "$reportDir\packer-marker-scan.txt" `
+                -Append
+          }
+
+          @(
+            "PACKER_IDENTIFICATION_FINISHED=true"
+            "ANDROID_PORT_STARTED=false"
+            "SOURCE_CODE_EXTRACTED=false"
+          ) | Out-File "$reportDir\v146k-summary.txt" -Append
+
       - name: Restricted launch and behavior capture
         shell: pwsh
         run: |
