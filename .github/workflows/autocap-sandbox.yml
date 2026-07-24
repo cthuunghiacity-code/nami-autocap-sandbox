@@ -30,10 +30,13 @@ jobs:
           HF_TOKEN: ${{ secrets.NAMI_HF_READ_TOKEN }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $headers = @{ Authorization = "Bearer $env:HF_TOKEN" }
           $url = "https://huggingface.co/datasets/$env:HF_REPO/resolve/main/$env:HF_FILE?download=true"
           $zip = "$env:RUNNER_TEMP\nami-autocap\source.zip"
-          Invoke-WebRequest -Uri $url -Headers $headers -OutFile $zip -UseBasicParsing
+          & curl.exe -fL --retry 3 --retry-delay 3 `
+            -H "Authorization: Bearer $env:HF_TOKEN" `
+            -o $zip `
+            $url
+          if ($LASTEXITCODE -ne 0) { throw "CURL_DOWNLOAD_FAILED=$LASTEXITCODE" }
           $sha = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
           if ($sha -ne $env:EXPECTED_ARCHIVE_SHA) { throw "ARCHIVE_SHA_MISMATCH=$sha" }
           "ARCHIVE_SHA256=$sha" | Out-File "$env:RUNNER_TEMP\nami-report\preflight.txt"
