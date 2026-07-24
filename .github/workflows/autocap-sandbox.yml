@@ -327,6 +327,247 @@ jobs:
             throw "DEFENDER_SCAN_FAILED=$exitCode"
           }
 
+      - name: Deep security metadata and Defender audit
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+
+          $reportDir = "$env:RUNNER_TEMP\nami-report"
+          $installDir = Split-Path $env:AUTOCAP_EXE -Parent
+          $report = "$reportDir\security-deep-audit.txt"
+
+          $signature = Get-AuthenticodeSignature `
+            -FilePath $env:AUTOCAP_EXE
+
+          $file = Get-Item $env:AUTOCAP_EXE
+          $version = $file.VersionInfo
+
+          @(
+            "AUTOCAP_PATH=$env:AUTOCAP_EXE"
+            "AUTOCAP_SIZE=$($file.Length)"
+            "SIGNATURE_STATUS=$($signature.Status)"
+            "SIGNER_SUBJECT=$($signature.SignerCertificate.Subject)"
+            "SIGNER_ISSUER=$($signature.SignerCertificate.Issuer)"
+            "PRODUCT_NAME=$($version.ProductName)"
+            "FILE_DESCRIPTION=$($version.FileDescription)"
+            "COMPANY_NAME=$($version.CompanyName)"
+            "FILE_VERSION=$($version.FileVersion)"
+            "PRODUCT_VERSION=$($version.ProductVersion)"
+            "INSTALL_DIR=$installDir"
+          ) | Out-File $report
+
+          try {
+            Start-MpScan `
+              -ScanType CustomScan `
+              -ScanPath $installDir
+
+            "START_MPSCAN_CALLED=true" |
+              Out-File $report -Append
+          }
+          catch {
+            "START_MPSCAN_ERROR=$($_.Exception.Message)" |
+              Out-File $report -Append
+          }
+
+          Start-Sleep -Seconds 20
+
+          try {
+            $status = Get-MpComputerStatus
+
+            @(
+              "DEFENDER_ENABLED=$($status.AntivirusEnabled)"
+              "REALTIME_PROTECTION=$($status.RealTimeProtectionEnabled)"
+              "ANTISPYWARE_ENABLED=$($status.AntispywareEnabled)"
+              "SIGNATURE_VERSION=$($status.AntivirusSignatureVersion)"
+              "LAST_FULL_SCAN=$($status.FullScanEndTime)"
+              "LAST_QUICK_SCAN=$($status.QuickScanEndTime)"
+            ) | Out-File $report -Append
+          }
+          catch {
+            "DEFENDER_STATUS_ERROR=$($_.Exception.Message)" |
+              Out-File $report -Append
+          }
+
+          try {
+            $threats = Get-MpThreatDetection
+
+            if ($threats) {
+              "THREAT_DETECTION_COUNT=$($threats.Count)" |
+                Out-File $report -Append
+
+              $threats |
+                Format-List * |
+                Out-String |
+                Out-File $report -Append
+            }
+            else {
+              "THREAT_DETECTION_COUNT=0" |
+                Out-File $report -Append
+            }
+          }
+          catch {
+            "THREAT_QUERY_ERROR=$($_.Exception.Message)" |
+              Out-File $report -Append
+          }
+
+      - name: Audit AutoCap command line and configuration
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+
+          $reportDir = "$env:RUNNER_TEMP\nami-report"
+          $report = "$reportDir\automation-interface-audit.txt"
+          $configReport = "$reportDir\autocap-config-files.txt"
+          $installDir = Split-Path $env:AUTOCAP_EXE -Parent
+
+          Remove-Item Env:HF_TOKEN -ErrorAction SilentlyContinue
+          Remove-Item Env:HF_TOKEN_B64 -ErrorAction SilentlyContinue
+          Remove-Item Env:NAMI_HF_READ_TOKEN -ErrorAction SilentlyContinue
+          Remove-Item Env:GITHUB_TOKEN -ErrorAction SilentlyContinue
+
+          New-NetFirewallRule `
+            -DisplayName "NAMI AutoCap Audit Block Outbound" `
+            -Direction Outbound `
+            -Program $env:AUTOCAP_EXE `
+            -Action Block `
+            -Profile Any `
+            -ErrorAction SilentlyContinue |
+            Out-Null
+
+          $rule = Get-NetFirewallRule `
+            -DisplayName "NAMI AutoCap Audit Block Outbound" `
+            -ErrorAction SilentlyContinue
+
+          @(
+            "AUTOCAP_EXE=$env:AUTOCAP_EXE"
+            "INSTALL_DIR=$installDir"
+            "OUTBOUND_RULE_EXISTS=$([bool]$rule)"
+            "CLI_AUDIT_STARTED=true"
+          ) | Out-File $report
+
+          $tests = @(
+            "--help"
+            "-h"
+            "/?"
+            "--version"
+            "-version"
+          )
+
+          foreach ($argument in $tests) {
+            $safeName = $argument `
+              -replace '[^a-zA-Z0-9]', '_'
+
+            $stdout = "$reportDir\cli_${safeName}_stdout.txt"
+            $stderr = "$reportDir\cli_${safeName}_stderr.txt"
+
+            try {
+              $process = Start-Process `
+                -FilePath $env:AUTOCAP_EXE `
+                -ArgumentList $argument `
+                -RedirectStandardOutput $stdout `
+                -RedirectStandardError $stderr `
+                -PassThru
+
+              $finished = $process.WaitForExit(10000)
+
+              if (-not $finished) {
+                Stop-Process `
+                  -Id $process.Id `
+                  -Force `
+                  -ErrorAction SilentlyContinue
+
+                "ARG=$argument TIMEOUT=true" |
+                  Out-File $report -Append
+              }
+              else {
+                "ARG=$argument EXIT=$($process.ExitCode)" |
+                  Out-File $report -Append
+              }
+            }
+            catch {
+              "ARG=$argument ERROR=$($_.Exception.Message)" |
+                Out-File $report -Append
+            }
+          }
+
+          $roots = @(
+            $installDir
+            "$env:LOCALAPPDATA\AutoCap"
+            "$env:APPDATA\AutoCap"
+            "$env:USERPROFILE\.autocap"
+            "$env:USERPROFILE\Documents"
+          )
+
+          $patterns = @(
+            "*.json"
+            "*.ini"
+            "*.yaml"
+            "*.yml"
+            "*.toml"
+            "*.cfg"
+            "*.conf"
+            "*.db"
+            "*.sqlite"
+            "*.log"
+          )
+
+          foreach ($root in $roots) {
+            if (-not (Test-Path $root)) {
+              continue
+            }
+
+            foreach ($pattern in $patterns) {
+              Get-ChildItem `
+                -Path $root `
+                -Recurse `
+                -File `
+                -Filter $pattern `
+                -ErrorAction SilentlyContinue |
+                Select-Object FullName, Length, LastWriteTime |
+                Format-Table -AutoSize |
+                Out-String |
+                Out-File $configReport -Append
+            }
+          }
+
+          $resourceKeywords = @(
+            "subtitle"
+            "translate"
+            "translation"
+            "export"
+            "ffmpeg"
+            "api"
+            "token"
+            "project"
+            "video"
+            "output"
+          )
+
+          $textFiles = Get-ChildItem `
+            -Path $installDir `
+            -Recurse `
+            -File `
+            -Include "*.json","*.ini","*.yaml","*.yml","*.cfg","*.conf","*.txt" `
+            -ErrorAction SilentlyContinue
+
+          foreach ($item in $textFiles) {
+            foreach ($keyword in $resourceKeywords) {
+              $matches = Select-String `
+                -Path $item.FullName `
+                -Pattern $keyword `
+                -SimpleMatch `
+                -ErrorAction SilentlyContinue
+
+              if ($matches) {
+                "KEYWORD=$keyword FILE=$($item.FullName)" |
+                  Out-File $configReport -Append
+              }
+            }
+          }
+
+          "CLI_AUDIT_FINISHED=true" |
+            Out-File $report -Append
+
       - name: Restricted launch and behavior capture
         shell: pwsh
         run: |
