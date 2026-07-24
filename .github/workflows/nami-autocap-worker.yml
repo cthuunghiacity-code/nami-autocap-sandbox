@@ -41,36 +41,36 @@ jobs:
             huggingface_hub
 
           python - <<'PY'
-import os
-from huggingface_hub import HfApi
-
-token = os.environ["HF_TOKEN"]
-repo_id = "Cthuunghiacity/nami-autocap-worker"
-
-api = HfApi(token=token)
-
-api.create_repo(
-    repo_id=repo_id,
-    repo_type="space",
-    space_sdk="docker",
-    private=False,
-    exist_ok=True,
-)
-
-api.upload_folder(
-    repo_id=repo_id,
-    repo_type="space",
-    folder_path="worker",
-    commit_message="deploy NAMI AutoCap worker V147B1",
-)
-
-print("HF_SPACE_DEPLOYED=PASS")
-print(f"HF_SPACE_REPO={repo_id}")
-print(
-    "HF_SPACE_URL="
-    "https://cthuunghiacity-nami-autocap-worker.hf.space"
-)
-PY
+          import os
+          from huggingface_hub import HfApi
+          
+          token = os.environ["HF_TOKEN"]
+          repo_id = "Cthuunghiacity/nami-autocap-worker"
+          
+          api = HfApi(token=token)
+          
+          api.create_repo(
+              repo_id=repo_id,
+              repo_type="space",
+              space_sdk="docker",
+              private=False,
+              exist_ok=True,
+          )
+          
+          api.upload_folder(
+              repo_id=repo_id,
+              repo_type="space",
+              folder_path="worker",
+              commit_message="deploy NAMI AutoCap worker V147B1",
+          )
+          
+          print("HF_SPACE_DEPLOYED=PASS")
+          print(f"HF_SPACE_REPO={repo_id}")
+          print(
+              "HF_SPACE_URL="
+              "https://cthuunghiacity-nami-autocap-worker.hf.space"
+          )
+          PY
 
       - name: Wait for worker health
         run: |
