@@ -1,0 +1,59 @@
+name: NAMI AutoCap Android APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+
+      - name: Build NAMI AutoCap debug APK
+        run: |
+          set -euo pipefail
+          gradle -p android clean assembleDebug
+
+      - name: Verify APK
+        run: |
+          set -euo pipefail
+
+          APK="android/app/build/outputs/apk/debug/app-debug.apk"
+
+          test -s "$APK"
+
+          mkdir -p output
+
+          cp "$APK" \
+            "output/NAMI_AutoCap_V147A_debug.apk"
+
+          sha256sum \
+            "output/NAMI_AutoCap_V147A_debug.apk" |
+            tee "output/NAMI_AutoCap_V147A_debug.sha256"
+
+          ls -lh output
+
+      - name: Upload installable APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: nami-autocap-v147a-apk
+          path: output/*
+          if-no-files-found: error
+          retention-days: 14
