@@ -140,26 +140,54 @@ jobs:
             -DestinationPath $extract `
             -Force
 
-          $exe = Get-ChildItem `
+          $allExe = Get-ChildItem `
             -Path $extract `
             -Recurse `
             -File `
-            -Filter "AutoCap.exe" |
+            -Filter "*.exe"
+
+          if (-not $allExe) {
+            throw "NO_EXE_FILES_FOUND"
+          }
+
+          $inventory = @()
+
+          foreach ($candidate in $allExe) {
+            $candidateSha = (
+              Get-FileHash `
+                -Algorithm SHA256 `
+                $candidate.FullName
+            ).Hash.ToLowerInvariant()
+
+            $inventory += [PSCustomObject]@{
+              Name = $candidate.Name
+              FullName = $candidate.FullName
+              Sha256 = $candidateSha
+              Size = $candidate.Length
+            }
+          }
+
+          $inventory |
+            Sort-Object Name |
+            Format-Table -AutoSize |
+            Out-String |
+            Out-File "$env:RUNNER_TEMP\nami-report\exe-inventory.txt"
+
+          $match = $inventory |
+            Where-Object {
+              $_.Sha256 -eq $env:EXPECTED_AUTOCAP_SHA
+            } |
             Select-Object -First 1
 
-          if (-not $exe) {
-            throw "AUTOCAP_EXE_NOT_FOUND"
+          if (-not $match) {
+            throw "EXPECTED_AUTOCAP_SHA_NOT_FOUND"
           }
 
-          $exeSha = (
-            Get-FileHash `
-              -Algorithm SHA256 `
-              $exe.FullName
-          ).Hash.ToLowerInvariant()
+          $exe = Get-Item $match.FullName
+          $exeSha = $match.Sha256
 
-          if ($exeSha -ne $env:EXPECTED_AUTOCAP_SHA) {
-            throw "AUTOCAP_SHA_MISMATCH=$exeSha"
-          }
+          Write-Host "AUTOCAP_MATCH_NAME=$($exe.Name)"
+          Write-Host "AUTOCAP_MATCH_SHA=$exeSha"
 
           @(
             "ARCHIVE_SHA256=$archiveSha"
