@@ -1,0 +1,148 @@
+name: Patch Existing NAMI Worker With AutoCap
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  patch-worker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Upload AutoCap extension safely
+        env:
+          HF_TOKEN_B64: ${{ secrets.NAMI_HF_TOKEN_B64 }}
+          AUTOCAP_KEY_B64: ${{ secrets.NAMI_AUTOCAP_KEY_B64 }}
+        run: |
+          set -euo pipefail
+
+          test -n "$HF_TOKEN_B64"
+          test -n "$AUTOCAP_KEY_B64"
+
+          HF_TOKEN="$(
+            printf '%s' "$HF_TOKEN_B64" |
+            base64 --decode
+          )"
+
+          AUTOCAP_KEY="$(
+            printf '%s' "$AUTOCAP_KEY_B64" |
+            base64 --decode
+          )"
+
+          export HF_TOKEN
+          export AUTOCAP_KEY
+
+          python -m pip install \
+            --disable-pip-version-check \
+            --no-input \
+            huggingface_hub
+
+          python - <<'PY'
+          import os
+          from huggingface_hub import CommitOperationAdd, HfApi
+
+          repo_id = "Cthuunghiacity/nc-ai-money-worker"
+          api = HfApi(token=os.environ["HF_TOKEN"])
+
+          operations = [
+              CommitOperationAdd(
+                  path_in_repo="app.py",
+                  path_or_fileobj="autocap_worker_patch/app.py",
+              ),
+              CommitOperationAdd(
+                  path_in_repo="autocap_routes.py",
+                  path_or_fileobj=(
+                      "autocap_worker_patch/"
+                      "autocap_routes.py"
+                  ),
+              ),
+              CommitOperationAdd(
+                  path_in_repo="requirements.txt",
+                  path_or_fileobj=(
+                      "autocap_worker_patch/"
+                      "requirements.txt"
+                  ),
+              ),
+          ]
+
+          api.create_commit(
+              repo_id=repo_id,
+              repo_type="space",
+              operations=operations,
+              commit_message=(
+                  "add isolated NAMI AutoCap routes V147B2"
+              ),
+          )
+
+          api.add_space_secret(
+              repo_id=repo_id,
+              key="NAMI_AUTOCAP_KEY",
+              value=os.environ["AUTOCAP_KEY"],
+          )
+
+          print("EXISTING_ROUTES_PRESERVED=true")
+          print("AUTOCAP_MODULE_UPLOADED=PASS")
+          print("AUTOCAP_SECRET_CONFIGURED=PASS")
+          PY
+
+      - name: Wait for rebuilt worker
+        env:
+          AUTOCAP_KEY_B64: ${{ secrets.NAMI_AUTOCAP_KEY_B64 }}
+        run: |
+          set -euo pipefail
+
+          BASE="https://cthuunghiacity-nc-ai-money-worker.hf.space"
+
+          for attempt in $(seq 1 90); do
+            echo "ATTEMPT=$attempt"
+
+            OLD_STATUS="$(
+              curl \
+                --silent \
+                --output /tmp/old-health.json \
+                --write-out '%{http_code}' \
+                --max-time 30 \
+                "$BASE/health" || true
+            )"
+
+            NEW_STATUS="$(
+              curl \
+                --silent \
+                --output /tmp/autocap-health.json \
+                --write-out '%{http_code}' \
+                --max-time 30 \
+                "$BASE/autocap/health" || true
+            )"
+
+            echo "OLD_HEALTH_STATUS=$OLD_STATUS"
+            echo "AUTOCAP_HEALTH_STATUS=$NEW_STATUS"
+
+            if (
+              [ "$OLD_STATUS" = "200" ] &&
+              [ "$NEW_STATUS" = "200" ]
+            ); then
+              cat /tmp/old-health.json
+              echo
+              cat /tmp/autocap-health.json
+              echo
+              echo "OLD_WORKER_HEALTH_PRESERVED=PASS"
+              echo "AUTOCAP_WORKER_HEALTH=PASS"
+              exit 0
+            fi
+
+            sleep 20
+          done
+
+          echo "WORKER_REBUILD_NOT_READY"
+          exit 1
