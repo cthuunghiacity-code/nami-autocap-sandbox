@@ -813,6 +813,315 @@ jobs:
           "GUI_AUDIT_FINISHED=true" |
             Out-File $guiReport -Append
 
+      - name: Static PyInstaller portability audit
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+
+          $reportDir = "$env:RUNNER_TEMP\nami-report"
+          $auditRoot = "$env:RUNNER_TEMP\nami-static-audit"
+          $extractRoot = "$auditRoot\extracted"
+          $toolRoot = "$auditRoot\tools"
+
+          New-Item -ItemType Directory -Force -Path $auditRoot | Out-Null
+          New-Item -ItemType Directory -Force -Path $extractRoot | Out-Null
+          New-Item -ItemType Directory -Force -Path $toolRoot | Out-Null
+
+          Remove-Item Env:HF_TOKEN -ErrorAction SilentlyContinue
+          Remove-Item Env:HF_TOKEN_B64 -ErrorAction SilentlyContinue
+          Remove-Item Env:NAMI_HF_READ_TOKEN -ErrorAction SilentlyContinue
+          Remove-Item Env:GITHUB_TOKEN -ErrorAction SilentlyContinue
+
+          $exe = $env:AUTOCAP_EXE
+          $exeSha = (
+            Get-FileHash -Algorithm SHA256 $exe
+          ).Hash.ToLowerInvariant()
+
+          @(
+            "AUTOCAP_EXE=$exe"
+            "AUTOCAP_SHA256=$exeSha"
+            "PRIVATE_USER_VIDEO_USED=false"
+            "GUI_INTERACTION_USED=false"
+            "STATIC_AUDIT_ONLY=true"
+          ) | Out-File "$reportDir\v146j-summary.txt"
+
+          python -m pip install `
+            --disable-pip-version-check `
+            --no-input `
+            pyinstaller `
+            pyinstxtractor-ng 2>&1 |
+            Out-File "$reportDir\python-tool-install.txt"
+
+          $archiveViewer = Get-Command pyi-archive_viewer.exe `
+            -ErrorAction SilentlyContinue
+
+          if ($archiveViewer) {
+            cmd /c "echo q|`"$($archiveViewer.Source)`" `"$exe`"" 2>&1 |
+              Out-File "$reportDir\pyinstaller-archive-list.txt"
+
+            "PYI_ARCHIVE_VIEWER_FOUND=true" |
+              Out-File "$reportDir\v146j-summary.txt" -Append
+          }
+          else {
+            "PYI_ARCHIVE_VIEWER_FOUND=false" |
+              Out-File "$reportDir\v146j-summary.txt" -Append
+          }
+
+          $extractor = Get-Command pyinstxtractor-ng.exe `
+            -ErrorAction SilentlyContinue
+
+          if (-not $extractor) {
+            $extractor = Get-Command pyinstxtractor-ng `
+              -ErrorAction SilentlyContinue
+          }
+
+          if ($extractor) {
+            Push-Location $extractRoot
+
+            & $extractor.Source $exe 2>&1 |
+              Out-File "$reportDir\pyinstxtractor-output.txt"
+
+            $extractExit = $LASTEXITCODE
+            Pop-Location
+
+            "PYINSTXTRACTOR_FOUND=true" |
+              Out-File "$reportDir\v146j-summary.txt" -Append
+
+            "PYINSTXTRACTOR_EXIT=$extractExit" |
+              Out-File "$reportDir\v146j-summary.txt" -Append
+          }
+          else {
+            "PYINSTXTRACTOR_FOUND=false" |
+              Out-File "$reportDir\v146j-summary.txt" -Append
+          }
+
+          $files = Get-ChildItem `
+            -Path $extractRoot `
+            -Recurse `
+            -File `
+            -ErrorAction SilentlyContinue
+
+          "EXTRACTED_FILE_COUNT=$($files.Count)" |
+            Out-File "$reportDir\v146j-summary.txt" -Append
+
+          $inventory = foreach ($item in $files) {
+            [PSCustomObject]@{
+              RelativePath = $item.FullName.Substring(
+                $extractRoot.Length
+              ).TrimStart('\')
+              Extension = $item.Extension
+              Size = $item.Length
+              Sha256 = (
+                Get-FileHash -Algorithm SHA256 $item.FullName
+              ).Hash.ToLowerInvariant()
+            }
+          }
+
+          $inventory |
+            Export-Csv `
+              "$reportDir\extracted-file-inventory.csv" `
+              -NoTypeInformation `
+              -Encoding UTF8
+
+          $moduleNames = $files |
+            Where-Object {
+              $_.Extension -in @(
+                ".pyc",
+                ".pyd",
+                ".py",
+                ".dll"
+              )
+            } |
+            ForEach-Object {
+              $_.FullName.Substring(
+                $extractRoot.Length
+              ).TrimStart('\')
+            } |
+            Sort-Object -Unique
+
+          $moduleNames |
+            Out-File `
+              "$reportDir\python-module-inventory.txt" `
+              -Encoding UTF8
+
+          $interestingExtensions = @(
+            ".json",
+            ".ini",
+            ".yaml",
+            ".yml",
+            ".toml",
+            ".cfg",
+            ".conf",
+            ".txt",
+            ".py",
+            ".pyc"
+          )
+
+          $keywords = @(
+            "http://",
+            "https://",
+            "/api/",
+            "api_key",
+            "token",
+            "subtitle",
+            "translate",
+            "translation",
+            "speech",
+            "whisper",
+            "ffmpeg",
+            "capcut",
+            "srt",
+            "export",
+            "upload",
+            "download",
+            "output"
+          )
+
+          $findings = New-Object System.Collections.Generic.List[string]
+
+          foreach ($item in $files) {
+            if ($item.Extension -notin $interestingExtensions) {
+              continue
+            }
+
+            if ($item.Length -gt 10485760) {
+              continue
+            }
+
+            try {
+              $content = Get-Content `
+                -LiteralPath $item.FullName `
+                -Raw `
+                -ErrorAction Stop
+
+              foreach ($keyword in $keywords) {
+                if ($content -match [regex]::Escape($keyword)) {
+                  $relative = $item.FullName.Substring(
+                    $extractRoot.Length
+                  ).TrimStart('\')
+
+                  $findings.Add(
+                    "KEYWORD=$keyword FILE=$relative"
+                  )
+                }
+              }
+            }
+            catch {
+            }
+          }
+
+          $findings |
+            Sort-Object -Unique |
+            Out-File `
+              "$reportDir\static-keyword-findings.txt" `
+              -Encoding UTF8
+
+          $stringReport = "$reportDir\redacted-network-strings.txt"
+
+          foreach ($item in $files) {
+            if ($item.Length -gt 60000000) {
+              continue
+            }
+
+            try {
+              $bytes = [System.IO.File]::ReadAllBytes(
+                $item.FullName
+              )
+
+              $ascii = [System.Text.Encoding]::ASCII.GetString(
+                $bytes
+              )
+
+              $matches = [regex]::Matches(
+                $ascii,
+                'https?://[A-Za-z0-9._~:/?#\[\]@!$&''()*+,;=%-]{6,}'
+              )
+
+              foreach ($match in $matches) {
+                $url = $match.Value
+
+                $url = $url -replace `
+                  '(?i)(api[_-]?key|token|secret|password)=([^&\s]+)',
+                  '$1=[REDACTED]'
+
+                $relative = $item.FullName.Substring(
+                  $extractRoot.Length
+                ).TrimStart('\')
+
+                "FILE=$relative URL=$url" |
+                  Out-File $stringReport -Append
+              }
+            }
+            catch {
+            }
+          }
+
+          $redactionPatterns = @(
+            '(?i)"api[_-]?key"\s*:\s*"[^"]*"',
+            '(?i)"token"\s*:\s*"[^"]*"',
+            '(?i)"secret"\s*:\s*"[^"]*"',
+            '(?i)"password"\s*:\s*"[^"]*"'
+          )
+
+          $configCandidates = $files |
+            Where-Object {
+              $_.Extension -in @(
+                ".json",
+                ".ini",
+                ".cfg",
+                ".conf",
+                ".yaml",
+                ".yml",
+                ".toml"
+              )
+            }
+
+          $configOut = "$reportDir\redacted-config-samples.txt"
+
+          foreach ($item in $configCandidates) {
+            if ($item.Length -gt 1048576) {
+              continue
+            }
+
+            try {
+              $content = Get-Content `
+                -LiteralPath $item.FullName `
+                -Raw `
+                -ErrorAction Stop
+
+              foreach ($pattern in $redactionPatterns) {
+                $content = $content -replace $pattern, {
+                  param($m)
+
+                  $name = (
+                    $m.Value -split ':'
+                  )[0]
+
+                  return "$name`: `"[REDACTED]`""
+                }
+              }
+
+              $relative = $item.FullName.Substring(
+                $extractRoot.Length
+              ).TrimStart('\')
+
+              @(
+                "===== FILE=$relative ====="
+                $content
+                ""
+              ) | Out-File $configOut -Append
+            }
+            catch {
+            }
+          }
+
+          @(
+            "STATIC_EXTRACTION_FINISHED=true"
+            "SOURCE_CODE_REBUILT=false"
+            "ANDROID_PORT_STARTED=false"
+            "CREDENTIAL_VALUES_EXPORTED=false"
+          ) | Out-File "$reportDir\v146j-summary.txt" -Append
+
       - name: Restricted launch and behavior capture
         shell: pwsh
         run: |
