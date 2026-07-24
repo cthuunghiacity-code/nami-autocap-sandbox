@@ -20,12 +20,31 @@ jobs:
     steps:
       - name: Download AutoCap from private NAMI storage
         env:
-          HF_TOKEN: ${{ secrets.NAMI_HF_READ_TOKEN }}
+          HF_TOKEN_B64: ${{ secrets.NAMI_HF_TOKEN_B64 }}
         shell: bash
         run: |
           set -euo pipefail
 
+          test -n "$HF_TOKEN_B64"
+
+          HF_TOKEN="$(
+            printf '%s' "$HF_TOKEN_B64" |
+            base64 --decode
+          )"
+
           test -n "$HF_TOKEN"
+
+          WHOAMI_HTTP="$(
+            curl --silent --show-error               --output "$RUNNER_TEMP/hf-whoami.json"               --write-out '%{http_code}'               --header "Authorization: Bearer ${HF_TOKEN}"               https://huggingface.co/api/whoami-v2
+          )"
+
+          echo "HF_WHOAMI_HTTP=$WHOAMI_HTTP"
+
+          if [ "$WHOAMI_HTTP" != "200" ]; then
+            cat "$RUNNER_TEMP/hf-whoami.json"
+            echo "GITHUB_SECRET_TOKEN_INVALID"
+            exit 1
+          fi
 
           URL="https://huggingface.co/datasets/${HF_REPO}/resolve/main/${HF_FILE}"
           mkdir -p "$RUNNER_TEMP/nami-transfer"
