@@ -26,6 +26,19 @@ jobs:
         with:
           gradle-version: '8.10.2'
 
+      - name: Inject private AutoCap worker key
+        env:
+          AUTOCAP_KEY_B64: ${{ secrets.NAMI_AUTOCAP_KEY_B64 }}
+        run: |
+          set -euo pipefail
+          test -n "$AUTOCAP_KEY_B64"
+          mkdir -p android/app/src/main/res/values
+          export AUTOCAP_KEY="$(
+            printf '%s' "$AUTOCAP_KEY_B64" |
+            base64 --decode
+          )"
+          python -c 'import os, pathlib, xml.sax.saxutils as x; p=pathlib.Path("android/app/src/main/res/values/secrets.xml"); p.write_text("<resources>\n<string name=\"nami_autocap_key\">" + x.escape(os.environ["AUTOCAP_KEY"]) + "</string>\n</resources>\n", encoding="utf-8")'
+
       - name: Build NAMI AutoCap debug APK
         run: |
           set -euo pipefail
@@ -42,10 +55,10 @@ jobs:
           mkdir -p output
 
           cp "$APK" \
-            "output/NAMI_AutoCap_V147A_debug.apk"
+            "output/NAMI_AutoCap_V147C_debug.apk"
 
           sha256sum \
-            "output/NAMI_AutoCap_V147A_debug.apk" |
+            "output/NAMI_AutoCap_V147C_debug.apk" |
             tee "output/NAMI_AutoCap_V147A_debug.sha256"
 
           ls -lh output
@@ -53,7 +66,7 @@ jobs:
       - name: Upload installable APK
         uses: actions/upload-artifact@v4
         with:
-          name: nami-autocap-v147a-apk
+          name: nami-autocap-v147c-apk
           path: output/*
           if-no-files-found: error
           retention-days: 14
