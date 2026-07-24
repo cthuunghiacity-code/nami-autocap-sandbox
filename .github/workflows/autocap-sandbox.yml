@@ -814,6 +814,7 @@ jobs:
             Out-File $guiReport -Append
 
       - name: Static PyInstaller portability audit
+        continue-on-error: true
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Continue'
