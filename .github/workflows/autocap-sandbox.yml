@@ -140,6 +140,58 @@ jobs:
             -DestinationPath $extract `
             -Force
 
+          $setup = Get-ChildItem `
+            -Path $extract `
+            -Recurse `
+            -File `
+            -Filter "*Setup*.exe" |
+            Select-Object -First 1
+
+          if (-not $setup) {
+            throw "AUTOCAP_SETUP_NOT_FOUND"
+          }
+
+          $payload = Join-Path $extract "installer-payload"
+          New-Item -ItemType Directory -Force -Path $payload |
+            Out-Null
+
+          $sevenZipCandidates = @(
+            "$env:ProgramFiles\7-Zip\7z.exe"
+            "$env:ProgramFiles\7-Zip\7za.exe"
+            "C:\Program Files\7-Zip\7z.exe"
+          )
+
+          $sevenZip = $sevenZipCandidates |
+            Where-Object { Test-Path $_ } |
+            Select-Object -First 1
+
+          if (-not $sevenZip) {
+            $sevenZipCommand = Get-Command 7z.exe -ErrorAction SilentlyContinue
+            if ($sevenZipCommand) {
+              $sevenZip = $sevenZipCommand.Source
+            }
+          }
+
+          if (-not $sevenZip) {
+            throw "SEVEN_ZIP_NOT_FOUND"
+          }
+
+          Write-Host "SETUP_NAME=$($setup.Name)"
+          Write-Host "STATIC_EXTRACTION_STARTED=true"
+
+          & $sevenZip `
+            x `
+            "-o$payload" `
+            -y `
+            $setup.FullName
+
+          $extractExit = $LASTEXITCODE
+          Write-Host "SEVEN_ZIP_EXIT_CODE=$extractExit"
+
+          if ($extractExit -notin @(0, 1)) {
+            throw "SETUP_STATIC_EXTRACTION_FAILED=$extractExit"
+          }
+
           $allExe = Get-ChildItem `
             -Path $extract `
             -Recurse `
@@ -147,7 +199,7 @@ jobs:
             -Filter "*.exe"
 
           if (-not $allExe) {
-            throw "NO_EXE_FILES_FOUND"
+            throw "NO_EXE_FILES_FOUND_AFTER_STATIC_EXTRACTION"
           }
 
           $inventory = @()
@@ -168,10 +220,20 @@ jobs:
           }
 
           $inventory |
-            Sort-Object Name |
-            Format-Table -AutoSize |
-            Out-String |
-            Out-File "$env:RUNNER_TEMP\nami-report\exe-inventory.txt"
+            Sort-Object FullName |
+            Export-Csv `
+              -Path "$env:RUNNER_TEMP\nami-report\exe-inventory.csv" `
+              -NoTypeInformation `
+              -Encoding UTF8
+
+          $inventory |
+            Sort-Object FullName |
+            ConvertTo-Json -Depth 4 |
+            Out-File `
+              "$env:RUNNER_TEMP\nami-report\exe-inventory.json" `
+              -Encoding UTF8
+
+          Write-Host "EXE_COUNT=$($inventory.Count)"
 
           $match = $inventory |
             Where-Object {
