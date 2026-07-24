@@ -27,12 +27,30 @@ jobs:
       - name: Download source through one-time NAMI bridge
         shell: pwsh
         env:
-          NAMI_TEMP_DOWNLOAD_URL: ${{ secrets.NAMI_AUTOCAP_TEMP_URL }}
+          NAMI_TEMP_DOWNLOAD_PATH: ${{ secrets.NAMI_AUTOCAP_TEMP_PATH }}
         run: |
           $ErrorActionPreference = 'Stop'
           $zip = "$env:RUNNER_TEMP\nami-autocap\source.zip"
+
+          $base = "https://cthuunghiacity-nami-tool-worker-01.hf.space"
+          $ticketPath = [string]$env:NAMI_TEMP_DOWNLOAD_PATH
+          $ticketPath = $ticketPath.Trim()
+
+          if (-not $ticketPath.StartsWith("/")) {
+            throw "INVALID_TEMP_DOWNLOAD_PATH"
+          }
+
+          $url = $base + $ticketPath
+
+          $uri = [System.Uri]$url
+          if ($uri.Host -ne "cthuunghiacity-nami-tool-worker-01.hf.space") {
+            throw "UNEXPECTED_DOWNLOAD_HOST"
+          }
+
+          Write-Host "DOWNLOAD_HOST=$($uri.Host)"
+
           Invoke-WebRequest `
-            -Uri $env:NAMI_TEMP_DOWNLOAD_URL `
+            -Uri $uri `
             -OutFile $zip `
             -MaximumRedirection 10 `
             -UseBasicParsing
@@ -41,7 +59,7 @@ jobs:
           $sha = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
           if ($sha -ne $env:EXPECTED_ARCHIVE_SHA) { throw "ARCHIVE_SHA_MISMATCH=$sha" }
           "ARCHIVE_SHA256=$sha" | Out-File "$env:RUNNER_TEMP\nami-report\preflight.txt"
-          Remove-Item Env:NAMI_TEMP_DOWNLOAD_URL -ErrorAction SilentlyContinue
+          Remove-Item Env:NAMI_TEMP_DOWNLOAD_PATH -ErrorAction SilentlyContinue
 
       - name: Extract portable package and verify executable
         shell: pwsh
