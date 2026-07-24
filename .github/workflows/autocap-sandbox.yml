@@ -31,8 +31,13 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $zip = "$env:RUNNER_TEMP\nami-autocap\source.zip"
-          & curl.exe -fL --retry 2 --retry-delay 2 -o $zip "$env:NAMI_TEMP_DOWNLOAD_URL"
-          if ($LASTEXITCODE -ne 0) { throw "BRIDGE_DOWNLOAD_FAILED=$LASTEXITCODE" }
+          Invoke-WebRequest `
+            -Uri $env:NAMI_TEMP_DOWNLOAD_URL `
+            -OutFile $zip `
+            -MaximumRedirection 10 `
+            -UseBasicParsing
+          if (-not (Test-Path $zip)) { throw "BRIDGE_DOWNLOAD_FILE_NOT_CREATED" }
+          if ((Get-Item $zip).Length -lt 1000000) { throw "BRIDGE_DOWNLOAD_FILE_TOO_SMALL" }
           $sha = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
           if ($sha -ne $env:EXPECTED_ARCHIVE_SHA) { throw "ARCHIVE_SHA_MISMATCH=$sha" }
           "ARCHIVE_SHA256=$sha" | Out-File "$env:RUNNER_TEMP\nami-report\preflight.txt"
