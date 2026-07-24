@@ -1,0 +1,101 @@
+name: Deploy NAMI AutoCap Worker
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-worker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Deploy Docker Space
+        env:
+          HF_TOKEN_B64: ${{ secrets.NAMI_HF_TOKEN_B64 }}
+        run: |
+          set -euo pipefail
+
+          test -n "$HF_TOKEN_B64"
+
+          HF_TOKEN="$(
+            printf '%s' "$HF_TOKEN_B64" |
+            base64 --decode
+          )"
+
+          export HF_TOKEN
+
+          python -m pip install \
+            --disable-pip-version-check \
+            --no-input \
+            huggingface_hub
+
+          python - <<'PY'
+import os
+from huggingface_hub import HfApi
+
+token = os.environ["HF_TOKEN"]
+repo_id = "Cthuunghiacity/nami-autocap-worker"
+
+api = HfApi(token=token)
+
+api.create_repo(
+    repo_id=repo_id,
+    repo_type="space",
+    space_sdk="docker",
+    private=False,
+    exist_ok=True,
+)
+
+api.upload_folder(
+    repo_id=repo_id,
+    repo_type="space",
+    folder_path="worker",
+    commit_message="deploy NAMI AutoCap worker V147B1",
+)
+
+print("HF_SPACE_DEPLOYED=PASS")
+print(f"HF_SPACE_REPO={repo_id}")
+print(
+    "HF_SPACE_URL="
+    "https://cthuunghiacity-nami-autocap-worker.hf.space"
+)
+PY
+
+      - name: Wait for worker health
+        run: |
+          set -euo pipefail
+
+          URL="https://cthuunghiacity-nami-autocap-worker.hf.space/health"
+
+          for attempt in $(seq 1 60); do
+            echo "HEALTH_ATTEMPT=$attempt"
+
+            if RESPONSE="$(
+              curl \
+                --silent \
+                --show-error \
+                --fail \
+                --max-time 30 \
+                "$URL" 2>/dev/null
+            )"; then
+              echo "$RESPONSE"
+              echo "WORKER_HEALTH=PASS"
+              exit 0
+            fi
+
+            sleep 20
+          done
+
+          echo "WORKER_HEALTH=NOT_READY_YET"
+          exit 1
