@@ -151,67 +151,100 @@ jobs:
             throw "AUTOCAP_SETUP_NOT_FOUND"
           }
 
-          $payload = Join-Path $extract "installer-payload"
-          New-Item -ItemType Directory -Force -Path $payload |
+          $setupSha = (
+            Get-FileHash `
+              -Algorithm SHA256 `
+              $setup.FullName
+          ).Hash.ToLowerInvariant()
+
+          Write-Host "SETUP_NAME=$($setup.Name)"
+          Write-Host "SETUP_SHA256=$setupSha"
+
+          Remove-Item Env:HF_TOKEN -ErrorAction SilentlyContinue
+          Remove-Item Env:HF_TOKEN_B64 -ErrorAction SilentlyContinue
+          Remove-Item Env:GITHUB_TOKEN -ErrorAction SilentlyContinue
+
+          New-NetFirewallRule `
+            -DisplayName "NAMI AutoCap Setup Block Outbound" `
+            -Direction Outbound `
+            -Program $setup.FullName `
+            -Action Block `
+            -Profile Any `
+            -ErrorAction SilentlyContinue |
             Out-Null
 
-          $sevenZipCandidates = @(
-            "$env:ProgramFiles\7-Zip\7z.exe"
-            "$env:ProgramFiles\7-Zip\7za.exe"
-            "C:\Program Files\7-Zip\7z.exe"
+          $beforeFiles = Get-ChildItem `
+            "$env:LOCALAPPDATA","$env:APPDATA","$env:ProgramFiles" `
+            -Recurse `
+            -File `
+            -Filter "*.exe" `
+            -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty FullName
+
+          $installArguments = @(
+            "/S"
+            "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-"
           )
 
-          $sevenZip = $sevenZipCandidates |
-            Where-Object { Test-Path $_ } |
-            Select-Object -First 1
+          $installed = $false
+          $installLog = @()
 
-          if (-not $sevenZip) {
-            $sevenZipCommand = Get-Command 7z.exe -ErrorAction SilentlyContinue
-            if ($sevenZipCommand) {
-              $sevenZip = $sevenZipCommand.Source
+          foreach ($arguments in $installArguments) {
+            try {
+              $process = Start-Process `
+                -FilePath $setup.FullName `
+                -ArgumentList $arguments `
+                -PassThru
+
+              if (-not $process.WaitForExit(90000)) {
+                Stop-Process `
+                  -Id $process.Id `
+                  -Force `
+                  -ErrorAction SilentlyContinue
+
+                $installLog += "ARGS=$arguments TIMEOUT=true"
+              }
+              else {
+                $installLog += "ARGS=$arguments EXIT=$($process.ExitCode)"
+
+                if ($process.ExitCode -eq 0) {
+                  $installed = $true
+                  break
+                }
+              }
+            }
+            catch {
+              $installLog += "ARGS=$arguments ERROR=$($_.Exception.Message)"
             }
           }
 
-          if (-not $sevenZip) {
-            throw "SEVEN_ZIP_NOT_FOUND"
+          $installLog |
+            Out-File "$env:RUNNER_TEMP\nami-report\installer.txt"
+
+          if (-not $installed) {
+            throw "AUTOCAP_SILENT_INSTALL_FAILED"
           }
 
-          Write-Host "SETUP_NAME=$($setup.Name)"
-          Write-Host "STATIC_EXTRACTION_STARTED=true"
-
-          & $sevenZip `
-            x `
-            "-o$payload" `
-            -y `
-            $setup.FullName
-
-          $extractExit = $LASTEXITCODE
-          Write-Host "SEVEN_ZIP_EXIT_CODE=$extractExit"
-
-          if ($extractExit -notin @(0, 1)) {
-            throw "SETUP_STATIC_EXTRACTION_FAILED=$extractExit"
-          }
-
-          $allExe = Get-ChildItem `
-            -Path $extract `
+          $afterExe = Get-ChildItem `
+            "$env:LOCALAPPDATA","$env:APPDATA","$env:ProgramFiles" `
             -Recurse `
             -File `
-            -Filter "*.exe"
+            -Filter "*.exe" `
+            -ErrorAction SilentlyContinue
 
-          if (-not $allExe) {
-            throw "NO_EXE_FILES_FOUND_AFTER_STATIC_EXTRACTION"
-          }
+          $newExe = $afterExe |
+            Where-Object {
+              $_.FullName -notin $beforeFiles
+            }
 
-          $inventory = @()
-
-          foreach ($candidate in $allExe) {
+          $inventory = foreach ($candidate in $newExe) {
             $candidateSha = (
               Get-FileHash `
                 -Algorithm SHA256 `
                 $candidate.FullName
             ).Hash.ToLowerInvariant()
 
-            $inventory += [PSCustomObject]@{
+            [PSCustomObject]@{
               Name = $candidate.Name
               FullName = $candidate.FullName
               Sha256 = $candidateSha
@@ -220,37 +253,30 @@ jobs:
           }
 
           $inventory |
-            Sort-Object FullName |
             Export-Csv `
-              -Path "$env:RUNNER_TEMP\nami-report\exe-inventory.csv" `
+              "$env:RUNNER_TEMP\nami-report\installed-exe-inventory.csv" `
               -NoTypeInformation `
               -Encoding UTF8
 
-          $inventory |
-            Sort-Object FullName |
-            ConvertTo-Json -Depth 4 |
-            Out-File `
-              "$env:RUNNER_TEMP\nami-report\exe-inventory.json" `
-              -Encoding UTF8
-
-          Write-Host "EXE_COUNT=$($inventory.Count)"
-
-          $match = $inventory |
+          $exe = $newExe |
             Where-Object {
-              $_.Sha256 -eq $env:EXPECTED_AUTOCAP_SHA
+              $_.Name -match "AutoCap"
             } |
+            Sort-Object Length -Descending |
             Select-Object -First 1
 
-          if (-not $match) {
-            throw "EXPECTED_AUTOCAP_SHA_NOT_FOUND"
+          if (-not $exe) {
+            throw "INSTALLED_AUTOCAP_EXE_NOT_FOUND"
           }
 
-          $exe = Get-Item $match.FullName
-          $exeSha = $match.Sha256
+          $exeSha = (
+            Get-FileHash `
+              -Algorithm SHA256 `
+              $exe.FullName
+          ).Hash.ToLowerInvariant()
 
-          Write-Host "AUTOCAP_MATCH_NAME=$($exe.Name)"
-          Write-Host "AUTOCAP_MATCH_SHA=$exeSha"
-
+          Write-Host "AUTOCAP_INSTALLED_PATH=$($exe.FullName)"
+          Write-Host "AUTOCAP_INSTALLED_SHA=$exeSha"
           @(
             "ARCHIVE_SHA256=$archiveSha"
             "AUTOCAP_PATH=$($exe.FullName)"
