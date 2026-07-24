@@ -1245,128 +1245,128 @@ jobs:
           }
 
           $pythonAudit = @'
-import json
-import math
-import os
-import sys
-
-import pefile
-
-exe = sys.argv[1]
-report_path = sys.argv[2]
-
-pe = pefile.PE(exe, fast_load=False)
-
-def entropy(data: bytes) -> float:
-    if not data:
-        return 0.0
-
-    counts = [0] * 256
-    for value in data:
-        counts[value] += 1
-
-    total = len(data)
-    result = 0.0
-
-    for count in counts:
-        if count:
-            probability = count / total
-            result -= probability * math.log2(probability)
-
-    return result
-
-result = {
-    "machine": hex(pe.FILE_HEADER.Machine),
-    "number_of_sections": pe.FILE_HEADER.NumberOfSections,
-    "timestamp": pe.FILE_HEADER.TimeDateStamp,
-    "characteristics": hex(pe.FILE_HEADER.Characteristics),
-    "entry_point_rva": hex(pe.OPTIONAL_HEADER.AddressOfEntryPoint),
-    "image_base": hex(pe.OPTIONAL_HEADER.ImageBase),
-    "subsystem": pe.OPTIONAL_HEADER.Subsystem,
-    "dll_characteristics": hex(pe.OPTIONAL_HEADER.DllCharacteristics),
-    "sections": [],
-    "imports": {},
-    "exports": [],
-    "resources": [],
-    "overlay": {},
-}
-
-for section in pe.sections:
-    name = section.Name.rstrip(b"\x00").decode(
-        "utf-8",
-        errors="replace",
-    )
-
-    raw = section.get_data()
-
-    result["sections"].append({
-        "name": name,
-        "virtual_address": hex(section.VirtualAddress),
-        "virtual_size": section.Misc_VirtualSize,
-        "raw_size": section.SizeOfRawData,
-        "entropy": round(entropy(raw), 4),
-        "characteristics": hex(section.Characteristics),
-    })
-
-if hasattr(pe, "DIRECTORY_ENTRY_IMPORT"):
-    for entry in pe.DIRECTORY_ENTRY_IMPORT:
-        dll = entry.dll.decode("utf-8", errors="replace")
-        names = []
-
-        for imported in entry.imports:
-            if imported.name:
-                names.append(
-                    imported.name.decode(
-                        "utf-8",
-                        errors="replace",
-                    )
-                )
-            else:
-                names.append(f"ordinal:{imported.ordinal}")
-
-        result["imports"][dll] = names
-
-if hasattr(pe, "DIRECTORY_ENTRY_EXPORT"):
-    for symbol in pe.DIRECTORY_ENTRY_EXPORT.symbols:
-        if symbol.name:
-            result["exports"].append(
-                symbol.name.decode(
-                    "utf-8",
-                    errors="replace",
-                )
-            )
-
-if hasattr(pe, "DIRECTORY_ENTRY_RESOURCE"):
-    for resource_type in pe.DIRECTORY_ENTRY_RESOURCE.entries:
-        type_name = (
-            str(resource_type.name)
-            if resource_type.name
-            else str(resource_type.struct.Id)
-        )
-        result["resources"].append(type_name)
-
-overlay_offset = pe.get_overlay_data_start_offset()
-
-if overlay_offset is not None:
-    file_size = os.path.getsize(exe)
-    result["overlay"] = {
-        "offset": overlay_offset,
-        "size": file_size - overlay_offset,
-    }
-else:
-    result["overlay"] = {
-        "offset": None,
-        "size": 0,
-    }
-
-with open(report_path, "w", encoding="utf-8") as handle:
-    json.dump(
-        result,
-        handle,
-        ensure_ascii=False,
-        indent=2,
-    )
-'@
+          import json
+          import math
+          import os
+          import sys
+          
+          import pefile
+          
+          exe = sys.argv[1]
+          report_path = sys.argv[2]
+          
+          pe = pefile.PE(exe, fast_load=False)
+          
+          def entropy(data: bytes) -> float:
+              if not data:
+                  return 0.0
+          
+              counts = [0] * 256
+              for value in data:
+                  counts[value] += 1
+          
+              total = len(data)
+              result = 0.0
+          
+              for count in counts:
+                  if count:
+                      probability = count / total
+                      result -= probability * math.log2(probability)
+          
+              return result
+          
+          result = {
+              "machine": hex(pe.FILE_HEADER.Machine),
+              "number_of_sections": pe.FILE_HEADER.NumberOfSections,
+              "timestamp": pe.FILE_HEADER.TimeDateStamp,
+              "characteristics": hex(pe.FILE_HEADER.Characteristics),
+              "entry_point_rva": hex(pe.OPTIONAL_HEADER.AddressOfEntryPoint),
+              "image_base": hex(pe.OPTIONAL_HEADER.ImageBase),
+              "subsystem": pe.OPTIONAL_HEADER.Subsystem,
+              "dll_characteristics": hex(pe.OPTIONAL_HEADER.DllCharacteristics),
+              "sections": [],
+              "imports": {},
+              "exports": [],
+              "resources": [],
+              "overlay": {},
+          }
+          
+          for section in pe.sections:
+              name = section.Name.rstrip(b"\x00").decode(
+                  "utf-8",
+                  errors="replace",
+              )
+          
+              raw = section.get_data()
+          
+              result["sections"].append({
+                  "name": name,
+                  "virtual_address": hex(section.VirtualAddress),
+                  "virtual_size": section.Misc_VirtualSize,
+                  "raw_size": section.SizeOfRawData,
+                  "entropy": round(entropy(raw), 4),
+                  "characteristics": hex(section.Characteristics),
+              })
+          
+          if hasattr(pe, "DIRECTORY_ENTRY_IMPORT"):
+              for entry in pe.DIRECTORY_ENTRY_IMPORT:
+                  dll = entry.dll.decode("utf-8", errors="replace")
+                  names = []
+          
+                  for imported in entry.imports:
+                      if imported.name:
+                          names.append(
+                              imported.name.decode(
+                                  "utf-8",
+                                  errors="replace",
+                              )
+                          )
+                      else:
+                          names.append(f"ordinal:{imported.ordinal}")
+          
+                  result["imports"][dll] = names
+          
+          if hasattr(pe, "DIRECTORY_ENTRY_EXPORT"):
+              for symbol in pe.DIRECTORY_ENTRY_EXPORT.symbols:
+                  if symbol.name:
+                      result["exports"].append(
+                          symbol.name.decode(
+                              "utf-8",
+                              errors="replace",
+                          )
+                      )
+          
+          if hasattr(pe, "DIRECTORY_ENTRY_RESOURCE"):
+              for resource_type in pe.DIRECTORY_ENTRY_RESOURCE.entries:
+                  type_name = (
+                      str(resource_type.name)
+                      if resource_type.name
+                      else str(resource_type.struct.Id)
+                  )
+                  result["resources"].append(type_name)
+          
+          overlay_offset = pe.get_overlay_data_start_offset()
+          
+          if overlay_offset is not None:
+              file_size = os.path.getsize(exe)
+              result["overlay"] = {
+                  "offset": overlay_offset,
+                  "size": file_size - overlay_offset,
+              }
+          else:
+              result["overlay"] = {
+                  "offset": None,
+                  "size": 0,
+              }
+          
+          with open(report_path, "w", encoding="utf-8") as handle:
+              json.dump(
+                  result,
+                  handle,
+                  ensure_ascii=False,
+                  indent=2,
+              )
+          '@
 
           $pythonPath = Join-Path $auditDir "pe_audit.py"
 
