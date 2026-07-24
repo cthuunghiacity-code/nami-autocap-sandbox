@@ -568,6 +568,251 @@ jobs:
           "CLI_AUDIT_FINISHED=true" |
             Out-File $report -Append
 
+      - name: Audit AutoCap GUI structure safely
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+
+          $reportDir = "$env:RUNNER_TEMP\nami-report"
+          $installDir = Split-Path $env:AUTOCAP_EXE -Parent
+          $guiReport = "$reportDir\gui-automation-tree.txt"
+          $configReport = "$reportDir\config-redacted.json"
+          $screenPath = "$reportDir\autocap-window.png"
+          $sampleVideo = "$env:RUNNER_TEMP\nami-report\synthetic-test.mp4"
+
+          Remove-Item Env:HF_TOKEN -ErrorAction SilentlyContinue
+          Remove-Item Env:HF_TOKEN_B64 -ErrorAction SilentlyContinue
+          Remove-Item Env:NAMI_HF_READ_TOKEN -ErrorAction SilentlyContinue
+          Remove-Item Env:GITHUB_TOKEN -ErrorAction SilentlyContinue
+
+          New-NetFirewallRule `
+            -DisplayName "NAMI AutoCap GUI Audit Block Outbound" `
+            -Direction Outbound `
+            -Program $env:AUTOCAP_EXE `
+            -Action Block `
+            -Profile Any `
+            -ErrorAction SilentlyContinue |
+            Out-Null
+
+          $ffmpeg = Join-Path $installDir "ffmpeg\ffmpeg.exe"
+
+          if (Test-Path $ffmpeg) {
+            & $ffmpeg `
+              -y `
+              -f lavfi `
+              -i "color=c=black:s=640x360:d=3" `
+              -f lavfi `
+              -i "sine=frequency=440:duration=3" `
+              -shortest `
+              -c:v libx264 `
+              -pix_fmt yuv420p `
+              -c:a aac `
+              $sampleVideo 2>&1 |
+              Out-File "$reportDir\synthetic-video-build.txt"
+
+            "SYNTHETIC_VIDEO_CREATED=$([bool](Test-Path $sampleVideo))" |
+              Out-File $guiReport
+          }
+          else {
+            "SYNTHETIC_VIDEO_CREATED=false" |
+              Out-File $guiReport
+          }
+
+          $config = Join-Path $installDir "config.json"
+
+          if (Test-Path $config) {
+            try {
+              $raw = Get-Content $config -Raw |
+                ConvertFrom-Json
+
+              function Redact-Object {
+                param([object]$Value)
+
+                if ($null -eq $Value) {
+                  return $null
+                }
+
+                if ($Value -is [System.Collections.IDictionary]) {
+                  $result = [ordered]@{}
+
+                  foreach ($key in $Value.Keys) {
+                    if ($key -match '(?i)token|secret|password|api.?key|credential|authorization') {
+                      $result[$key] = "[REDACTED]"
+                    }
+                    else {
+                      $result[$key] = Redact-Object $Value[$key]
+                    }
+                  }
+
+                  return $result
+                }
+
+                if ($Value -is [PSCustomObject]) {
+                  $result = [ordered]@{}
+
+                  foreach ($property in $Value.PSObject.Properties) {
+                    if ($property.Name -match '(?i)token|secret|password|api.?key|credential|authorization') {
+                      $result[$property.Name] = "[REDACTED]"
+                    }
+                    else {
+                      $result[$property.Name] = Redact-Object $property.Value
+                    }
+                  }
+
+                  return $result
+                }
+
+                if (
+                  $Value -is [System.Collections.IEnumerable] -and
+                  $Value -isnot [string]
+                ) {
+                  return @(
+                    foreach ($item in $Value) {
+                      Redact-Object $item
+                    }
+                  )
+                }
+
+                return $Value
+              }
+
+              $redacted = Redact-Object $raw
+              $redacted |
+                ConvertTo-Json -Depth 20 |
+                Out-File $configReport -Encoding UTF8
+
+              "CONFIG_REDACTED=true" |
+                Out-File $guiReport -Append
+            }
+            catch {
+              "CONFIG_REDACTION_ERROR=$($_.Exception.Message)" |
+                Out-File $guiReport -Append
+            }
+          }
+          else {
+            "CONFIG_FILE_FOUND=false" |
+              Out-File $guiReport -Append
+          }
+
+          try {
+            $process = Start-Process `
+              -FilePath $env:AUTOCAP_EXE `
+              -PassThru
+
+            Start-Sleep -Seconds 12
+            $process.Refresh()
+
+            @(
+              "AUTOCAP_PID=$($process.Id)"
+              "MAIN_WINDOW_HANDLE=$($process.MainWindowHandle)"
+              "MAIN_WINDOW_TITLE=$($process.MainWindowTitle)"
+              "PROCESS_EXITED=$($process.HasExited)"
+            ) | Out-File $guiReport -Append
+
+            Add-Type -AssemblyName UIAutomationClient
+            Add-Type -AssemblyName UIAutomationTypes
+
+            if ($process.MainWindowHandle -ne 0) {
+              $root = [System.Windows.Automation.AutomationElement]::FromHandle(
+                $process.MainWindowHandle
+              )
+
+              $condition = [System.Windows.Automation.Condition]::TrueCondition
+              $elements = $root.FindAll(
+                [System.Windows.Automation.TreeScope]::Descendants,
+                $condition
+              )
+
+              "UI_ELEMENT_COUNT=$($elements.Count)" |
+                Out-File $guiReport -Append
+
+              for ($index = 0; $index -lt $elements.Count; $index++) {
+                $element = $elements.Item($index)
+
+                try {
+                  $current = $element.Current
+
+                  @(
+                    "INDEX=$index"
+                    "NAME=$($current.Name)"
+                    "AUTOMATION_ID=$($current.AutomationId)"
+                    "CONTROL_TYPE=$($current.ControlType.ProgrammaticName)"
+                    "CLASS_NAME=$($current.ClassName)"
+                    "IS_ENABLED=$($current.IsEnabled)"
+                    "IS_OFFSCREEN=$($current.IsOffscreen)"
+                    "BOUNDING_RECT=$($current.BoundingRectangle)"
+                    "---"
+                  ) | Out-File $guiReport -Append
+                }
+                catch {
+                  "INDEX=$index READ_ERROR=$($_.Exception.Message)" |
+                    Out-File $guiReport -Append
+                }
+              }
+
+              try {
+                Add-Type -AssemblyName System.Drawing
+
+                $rectangle = $root.Current.BoundingRectangle
+                $width = [Math]::Max(1, [int]$rectangle.Width)
+                $height = [Math]::Max(1, [int]$rectangle.Height)
+
+                $bitmap = New-Object System.Drawing.Bitmap(
+                  $width,
+                  $height
+                )
+
+                $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+
+                $graphics.CopyFromScreen(
+                  [int]$rectangle.X,
+                  [int]$rectangle.Y,
+                  0,
+                  0,
+                  $bitmap.Size
+                )
+
+                $bitmap.Save(
+                  $screenPath,
+                  [System.Drawing.Imaging.ImageFormat]::Png
+                )
+
+                $graphics.Dispose()
+                $bitmap.Dispose()
+
+                "WINDOW_SCREENSHOT_CREATED=true" |
+                  Out-File $guiReport -Append
+              }
+              catch {
+                "WINDOW_SCREENSHOT_ERROR=$($_.Exception.Message)" |
+                  Out-File $guiReport -Append
+              }
+            }
+            else {
+              "GUI_WINDOW_NOT_AVAILABLE=true" |
+                Out-File $guiReport -Append
+            }
+
+            if (-not $process.HasExited) {
+              Stop-Process `
+                -Id $process.Id `
+                -Force `
+                -ErrorAction SilentlyContinue
+            }
+          }
+          catch {
+            "GUI_AUDIT_START_ERROR=$($_.Exception.Message)" |
+              Out-File $guiReport -Append
+          }
+
+          Remove-Item $sampleVideo -Force -ErrorAction SilentlyContinue
+
+          "PRIVATE_USER_VIDEO_USED=false" |
+            Out-File $guiReport -Append
+
+          "GUI_AUDIT_FINISHED=true" |
+            Out-File $guiReport -Append
+
       - name: Restricted launch and behavior capture
         shell: pwsh
         run: |
