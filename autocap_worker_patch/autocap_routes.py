@@ -14,7 +14,7 @@ from fastapi import File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
 
-VERSION = "NAMI_V147D_SUBTITLE_AND_VIETNAMESE_DUB"
+VERSION = "NAMI_V147E_CONTEXT_AWARE_TRANSLATION"
 MAX_UPLOAD_BYTES = 120 * 1024 * 1024
 
 _PROCESS_LOCK = Lock()
@@ -28,7 +28,7 @@ def _load_whisper():
     with _MODEL_LOCK:
         if _WHISPER_MODEL is None:
             _WHISPER_MODEL = WhisperModel(
-                "tiny",
+                "base",
                 device="cpu",
                 compute_type="int8",
                 cpu_threads=2,
@@ -134,14 +134,14 @@ def _subtitle_filter(path: Path) -> str:
 
     style = (
         "FontName=Arial,"
-        "FontSize=18,"
+        "FontSize=15,"
         "PrimaryColour=&H00FFFFFF,"
         "OutlineColour=&H00000000,"
         "BorderStyle=1,"
         "Outline=2,"
         "Shadow=0,"
         "Alignment=2,"
-        "MarginV=58"
+        "MarginV=42"
     )
 
     return (
@@ -417,7 +417,12 @@ def register_autocap_routes(app) -> None:
                     language="zh",
                     task="transcribe",
                     vad_filter=True,
-                    beam_size=1,
+                    beam_size=3,
+                    condition_on_previous_text=True,
+                    initial_prompt=(
+                        "这是中文影视对白，请准确识别人物对话，"
+                        "保留完整句子和自然标点。"
+                    ),
                 )
 
                 items = []
@@ -447,6 +452,39 @@ def register_autocap_routes(app) -> None:
                         ),
                     )
 
+                merged_items = []
+
+                for item in items:
+                    if not merged_items:
+                        merged_items.append(item)
+                        continue
+
+                    previous = merged_items[-1]
+                    gap = item["start"] - previous["end"]
+                    combined = (
+                        previous["source"]
+                        + item["source"]
+                    )
+
+                    previous_duration = (
+                        previous["end"]
+                        - previous["start"]
+                    )
+
+                    should_merge = (
+                        gap <= 0.65
+                        and len(combined) <= 48
+                        and previous_duration <= 7.5
+                    )
+
+                    if should_merge:
+                        previous["source"] = combined
+                        previous["end"] = item["end"]
+                    else:
+                        merged_items.append(item)
+
+                items = merged_items
+
                 translations = _translate_batch([
                     item["source"]
                     for item in items
@@ -467,13 +505,46 @@ def register_autocap_routes(app) -> None:
                             "[Không dịch được câu này]"
                         )
 
+                    words = vietnamese.split()
+                    wrapped_lines = []
+                    current_line = ""
+
+                    for word in words:
+                        candidate = (
+                            word
+                            if not current_line
+                            else current_line + " " + word
+                        )
+
+                        if len(candidate) <= 38:
+                            current_line = candidate
+                        else:
+                            if current_line:
+                                wrapped_lines.append(
+                                    current_line
+                                )
+                            current_line = word
+
+                    if current_line:
+                        wrapped_lines.append(current_line)
+
+                    if len(wrapped_lines) > 2:
+                        wrapped_lines = [
+                            wrapped_lines[0],
+                            " ".join(wrapped_lines[1:]),
+                        ]
+
+                    display_text = "\n".join(
+                        wrapped_lines
+                    )
+
                     item["vietnamese"] = vietnamese
 
                     subtitle_blocks.append(
                         f"{index}\n"
                         f'{_timestamp(item["start"])} '
                         f'--> {_timestamp(item["end"])}\n'
-                        f"{vietnamese}\n"
+                        f"{display_text}\n"
                     )
 
                 srt_path.write_text(
