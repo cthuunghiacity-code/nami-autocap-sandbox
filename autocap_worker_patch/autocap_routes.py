@@ -19,7 +19,7 @@ from fastapi import File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
 
-VERSION = "NAMI_V147J_MULTI_BAND_CHINESE_OCR"
+VERSION = "NAMI_V147K_CPU_BASIC_LIGHT_OCR"
 MAX_UPLOAD_BYTES = 120 * 1024 * 1024
 
 _PROCESS_LOCK = Lock()
@@ -745,10 +745,8 @@ def _ocr_one_frame(frame_path: Path) -> str:
 
     # Tự thử nhiều dải vì mỗi nguồn video đặt phụ đề khác nhau.
     candidate_bands = [
-        (0.48, 0.68),
-        (0.55, 0.75),
-        (0.62, 0.82),
-        (0.69, 0.89),
+        (0.56, 0.76),
+        (0.66, 0.86),
         (0.76, 0.97),
     ]
 
@@ -794,25 +792,10 @@ def _ocr_one_frame(frame_path: Path) -> str:
                 cv2.THRESH_BINARY
                 + cv2.THRESH_OTSU,
             )[1],
-            cv2.threshold(
-                blurred,
-                0,
-                255,
-                cv2.THRESH_BINARY_INV
-                + cv2.THRESH_OTSU,
-            )[1],
-            cv2.adaptiveThreshold(
-                blurred,
-                255,
-                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                cv2.THRESH_BINARY,
-                31,
-                9,
-            ),
         ]
 
         for variant in variants:
-            for psm in (6, 7, 11):
+            for psm in (7,):
                 try:
                     data = pytesseract.image_to_data(
                         variant,
@@ -899,7 +882,7 @@ def _extract_ocr_items(
         str(input_path),
         "-vf",
         (
-            "fps=3,scale=iw:ih"
+            "fps=1,scale=iw:ih"
         ),
         str(frame_pattern),
     ])
@@ -1040,7 +1023,9 @@ def register_autocap_routes(app) -> None:
             "recognition_primary": "chinese_caption_ocr",
             "recognition_fallback": "whisper",
             "diagnostic_endpoint": "/autocap/diagnose",
-            "ocr_band_mode": "automatic_multi_band",
+            "ocr_band_mode": "cpu_basic_light_multi_band",
+            "ocr_sampling_fps": 1,
+            "ocr_candidate_bands": 3,
             "subtitle_timing_source": "chinese_speech",
             "dubbing_timing_source": "chinese_speech",
             "translation_source_policy": (
