@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 import subprocess
@@ -7,12 +8,13 @@ import tempfile
 from pathlib import Path
 from threading import Lock
 
+import edge_tts
 from deep_translator import GoogleTranslator
-from fastapi import File, Header, HTTPException, UploadFile
+from fastapi import File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
 
-VERSION = "NAMI_V147B2_AUTOCAP_REAL_WORKER"
+VERSION = "NAMI_V147D_SUBTITLE_AND_VIETNAMESE_DUB"
 MAX_UPLOAD_BYTES = 120 * 1024 * 1024
 
 _PROCESS_LOCK = Lock()
@@ -62,7 +64,7 @@ def _run(args: list[str]) -> None:
     )
 
     if result.returncode != 0:
-        raise RuntimeError(result.stderr[-4000:])
+        raise RuntimeError(result.stderr[-5000:])
 
 
 def _timestamp(seconds: float) -> str:
@@ -109,6 +111,22 @@ def _translate_batch(texts: list[str]) -> list[str]:
     return results
 
 
+async def _create_voice(
+    text: str,
+    output_path: Path,
+    voice: str,
+) -> None:
+    communicator = edge_tts.Communicate(
+        text=text,
+        voice=voice,
+        rate="+8%",
+        volume="+0%",
+        pitch="+0Hz",
+    )
+
+    await communicator.save(str(output_path))
+
+
 def _subtitle_filter(path: Path) -> str:
     escaped = str(path).replace("\\", "/")
     escaped = escaped.replace(":", r"\:")
@@ -132,6 +150,151 @@ def _subtitle_filter(path: Path) -> str:
     )
 
 
+def _video_has_audio(path: Path) -> bool:
+    result = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "a",
+            "-show_entries",
+            "stream=index",
+            "-of",
+            "csv=p=0",
+            str(path),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+
+    return bool(result.stdout.strip())
+
+
+def _render_subtitle_only(
+    input_path: Path,
+    srt_path: Path,
+    output_path: Path,
+) -> None:
+    args = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(input_path),
+        "-vf",
+        _subtitle_filter(srt_path),
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "24",
+    ]
+
+    if _video_has_audio(input_path):
+        args.extend([
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+        ])
+    else:
+        args.append("-an")
+
+    args.extend([
+        "-movflags",
+        "+faststart",
+        str(output_path),
+    ])
+
+    _run(args)
+
+
+def _render_with_dubbing(
+    input_path: Path,
+    srt_path: Path,
+    voice_files: list[tuple[Path, int]],
+    output_path: Path,
+) -> None:
+    args = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(input_path),
+    ]
+
+    for voice_path, _ in voice_files:
+        args.extend(["-i", str(voice_path)])
+
+    filters: list[str] = []
+    mix_labels: list[str] = []
+
+    if _video_has_audio(input_path):
+        filters.append("[0:a]volume=0.16[original]")
+        mix_labels.append("[original]")
+    else:
+        filters.append(
+            "anullsrc=channel_layout=stereo:"
+            "sample_rate=44100[original]"
+        )
+        mix_labels.append("[original]")
+
+    for index, (_, delay_ms) in enumerate(
+        voice_files,
+        start=1,
+    ):
+        label = f"voice{index}"
+
+        filters.append(
+            f"[{index}:a]"
+            f"aresample=44100,"
+            f"adelay={delay_ms}|{delay_ms},"
+            f"volume=1.35"
+            f"[{label}]"
+        )
+
+        mix_labels.append(f"[{label}]")
+
+    mix_inputs = "".join(mix_labels)
+
+    filters.append(
+        f"{mix_inputs}"
+        f"amix=inputs={len(mix_labels)}:"
+        f"duration=first:"
+        f"dropout_transition=0:"
+        f"normalize=0"
+        f"[mixed]"
+    )
+
+    _run([
+        *args,
+        "-filter_complex",
+        ";".join(filters),
+        "-map",
+        "0:v:0",
+        "-map",
+        "[mixed]",
+        "-vf",
+        _subtitle_filter(srt_path),
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "24",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "160k",
+        "-movflags",
+        "+faststart",
+        "-shortest",
+        str(output_path),
+    ])
+
+
 def register_autocap_routes(app) -> None:
     @app.get("/autocap/health")
     def autocap_health():
@@ -140,20 +303,42 @@ def register_autocap_routes(app) -> None:
             "version": VERSION,
             "worker_ready": True,
             "heavy_work_on_phone": False,
-            "source_language": "zh",
-            "target_language": "vi",
+            "subtitle_mode": True,
+            "vietnamese_dubbing_mode": True,
+            "voices": {
+                "female": "vi-VN-HoaiMyNeural",
+                "male": "vi-VN-NamMinhNeural",
+            },
             "max_upload_mb": 120,
         }
 
     @app.post("/autocap/process")
     def autocap_process(
         video: UploadFile = File(...),
+        mode: str = Form(default="subtitle"),
+        voice: str = Form(
+            default="vi-VN-HoaiMyNeural"
+        ),
         x_nami_key: str | None = Header(
             default=None,
             alias="X-NAMI-Key",
         ),
     ):
         _check_owner_key(x_nami_key)
+
+        if mode not in {"subtitle", "dub"}:
+            raise HTTPException(
+                status_code=400,
+                detail="Unsupported processing mode",
+            )
+
+        allowed_voices = {
+            "vi-VN-HoaiMyNeural",
+            "vi-VN-NamMinhNeural",
+        }
+
+        if voice not in allowed_voices:
+            voice = "vi-VN-HoaiMyNeural"
 
         if not video.filename:
             raise HTTPException(
@@ -163,21 +348,24 @@ def register_autocap_routes(app) -> None:
 
         with _PROCESS_LOCK:
             job_dir = Path(
-                tempfile.mkdtemp(prefix="nami_autocap_")
+                tempfile.mkdtemp(
+                    prefix="nami_autocap_"
+                )
             )
 
             input_path = job_dir / "input.mp4"
             audio_path = job_dir / "audio.wav"
-            zh_path = job_dir / "transcript_zh.txt"
             srt_path = job_dir / "subtitles_vi.srt"
-            output_path = job_dir / "vietsub.mp4"
+            output_path = job_dir / "result.mp4"
 
             try:
                 total = 0
 
                 with input_path.open("wb") as output:
                     while True:
-                        chunk = video.file.read(1024 * 1024)
+                        chunk = video.file.read(
+                            1024 * 1024
+                        )
 
                         if not chunk:
                             break
@@ -187,7 +375,9 @@ def register_autocap_routes(app) -> None:
                         if total > MAX_UPLOAD_BYTES:
                             raise HTTPException(
                                 status_code=413,
-                                detail="Video exceeds 120 MB",
+                                detail=(
+                                    "Video exceeds 120 MB"
+                                ),
                             )
 
                         output.write(chunk)
@@ -196,6 +386,15 @@ def register_autocap_routes(app) -> None:
                     raise HTTPException(
                         status_code=400,
                         detail="Video is empty",
+                    )
+
+                if not _video_has_audio(input_path):
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            "Video không có âm thanh "
+                            "để nhận dạng lời nói."
+                        ),
                     )
 
                 _run([
@@ -230,15 +429,22 @@ def register_autocap_routes(app) -> None:
 
                     if source:
                         items.append({
-                            "start": float(segment.start),
-                            "end": float(segment.end),
+                            "start": float(
+                                segment.start
+                            ),
+                            "end": float(
+                                segment.end
+                            ),
                             "source": source,
                         })
 
                 if not items:
                     raise HTTPException(
                         status_code=422,
-                        detail="No Chinese speech detected",
+                        detail=(
+                            "Không nhận dạng được "
+                            "lời nói tiếng Trung."
+                        ),
                     )
 
                 translations = _translate_batch([
@@ -246,68 +452,93 @@ def register_autocap_routes(app) -> None:
                     for item in items
                 ])
 
-                transcript_lines = []
                 subtitle_blocks = []
 
-                for index, item in enumerate(items, start=1):
-                    vietnamese = translations[index - 1]
+                for index, item in enumerate(
+                    items,
+                    start=1,
+                ):
+                    vietnamese = translations[
+                        index - 1
+                    ]
 
                     if not vietnamese:
-                        vietnamese = "[Không dịch được câu này]"
+                        vietnamese = (
+                            "[Không dịch được câu này]"
+                        )
 
-                    transcript_lines.append(
-                        f'{_timestamp(item["start"])} '
-                        f'{item["source"]}'
-                    )
+                    item["vietnamese"] = vietnamese
 
                     subtitle_blocks.append(
                         f"{index}\n"
-                        f'{_timestamp(item["start"])} --> '
-                        f'{_timestamp(item["end"])}\n'
+                        f'{_timestamp(item["start"])} '
+                        f'--> {_timestamp(item["end"])}\n'
                         f"{vietnamese}\n"
                     )
-
-                zh_path.write_text(
-                    "\n".join(transcript_lines) + "\n",
-                    encoding="utf-8",
-                )
 
                 srt_path.write_text(
                     "\n".join(subtitle_blocks),
                     encoding="utf-8",
                 )
 
-                _run([
-                    "ffmpeg",
-                    "-y",
-                    "-i",
-                    str(input_path),
-                    "-vf",
-                    _subtitle_filter(srt_path),
-                    "-c:v",
-                    "libx264",
-                    "-preset",
-                    "veryfast",
-                    "-crf",
-                    "24",
-                    "-c:a",
-                    "aac",
-                    "-b:a",
-                    "128k",
-                    "-movflags",
-                    "+faststart",
-                    str(output_path),
-                ])
+                if mode == "dub":
+                    voice_files = []
+
+                    for index, item in enumerate(
+                        items,
+                        start=1,
+                    ):
+                        voice_path = (
+                            job_dir
+                            / f"voice_{index:04d}.mp3"
+                        )
+
+                        asyncio.run(
+                            _create_voice(
+                                str(
+                                    item["vietnamese"]
+                                ),
+                                voice_path,
+                                voice,
+                            )
+                        )
+
+                        voice_files.append((
+                            voice_path,
+                            round(
+                                float(item["start"])
+                                * 1000
+                            ),
+                        ))
+
+                    _render_with_dubbing(
+                        input_path,
+                        srt_path,
+                        voice_files,
+                        output_path,
+                    )
+                else:
+                    _render_subtitle_only(
+                        input_path,
+                        srt_path,
+                        output_path,
+                    )
 
                 if not output_path.is_file():
                     raise RuntimeError(
                         "Output video was not created"
                     )
 
+                filename = (
+                    "NAMI_AutoCap_long_tieng_Viet.mp4"
+                    if mode == "dub"
+                    else "NAMI_AutoCap_vietsub.mp4"
+                )
+
                 return FileResponse(
                     path=str(output_path),
                     media_type="video/mp4",
-                    filename="NAMI_AutoCap_vietsub.mp4",
+                    filename=filename,
                 )
 
             except HTTPException:

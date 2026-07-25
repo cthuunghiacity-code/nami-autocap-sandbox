@@ -108,7 +108,9 @@ public final class MainActivity extends Activity {
         modeSpinner = new Spinner(this);
 
         String[] modes = new String[] {
-            "Tạo video có phụ đề tiếng Việt"
+            "Tạo video có phụ đề tiếng Việt",
+            "Phụ đề + lồng tiếng Việt nữ",
+            "Phụ đề + lồng tiếng Việt nam"
         };
 
         ArrayAdapter<String> adapter = new ArrayAdapter<>(
@@ -144,7 +146,7 @@ public final class MainActivity extends Activity {
         root.addView(statusText, spaced());
 
         TextView version = text(
-            "Phiên bản 0.2.0 • V147C",
+            "Phiên bản 0.3.0 • V147D",
             12,
             Color.rgb(130, 136, 150)
         );
@@ -234,13 +236,13 @@ public final class MainActivity extends Activity {
                     setControlsEnabled(true);
 
                     statusText.setText(
-                        "Hoàn tất: Video vietsub đã được lưu "
-                            + "trong thư mục Download."
+                        "Hoàn tất: Video đã được lưu tại "
+                            + "Movies/NAMI AutoCap/."
                     );
 
                     Toast.makeText(
                         this,
-                        "Đã lưu NAMI_AutoCap_vietsub.mp4",
+                        "Đã lưu video trong Movies/NAMI AutoCap",
                         Toast.LENGTH_LONG
                     ).show();
 
@@ -304,6 +306,35 @@ public final class MainActivity extends Activity {
         ) {
             String safeName =
                 selectedVideoName.replace("\"", "_");
+
+            int selectedMode =
+                modeSpinner.getSelectedItemPosition();
+
+            String mode =
+                selectedMode == 0
+                    ? "subtitle"
+                    : "dub";
+
+            String voice =
+                selectedMode == 2
+                    ? "vi-VN-NamMinhNeural"
+                    : "vi-VN-HoaiMyNeural";
+
+            String fields =
+                "--" + boundary + "\r\n"
+                    + "Content-Disposition: form-data; "
+                    + "name=\"mode\"\r\n\r\n"
+                    + mode + "\r\n"
+                    + "--" + boundary + "\r\n"
+                    + "Content-Disposition: form-data; "
+                    + "name=\"voice\"\r\n\r\n"
+                    + voice + "\r\n";
+
+            rawOutput.write(
+                fields.getBytes(
+                    StandardCharsets.UTF_8
+                )
+            );
 
             String header =
                 "--" + boundary + "\r\n"
@@ -425,7 +456,8 @@ public final class MainActivity extends Activity {
             );
             values.put(
                 MediaStore.Video.Media.RELATIVE_PATH,
-                Environment.DIRECTORY_DOWNLOADS
+                Environment.DIRECTORY_MOVIES
+                    + "/NAMI AutoCap"
             );
             values.put(
                 MediaStore.Video.Media.IS_PENDING,
