@@ -19,7 +19,7 @@ from fastapi import File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
 
-VERSION = "NAMI_V147L_BOTTOM_CHINESE_ONLY_OCR"
+VERSION = "NAMI_V147M_STABLE_CAPTION_SENTENCE_OCR"
 MAX_UPLOAD_BYTES = 120 * 1024 * 1024
 
 _PROCESS_LOCK = Lock()
@@ -897,7 +897,8 @@ def _extract_ocr_items(
     for index, frame_path in enumerate(
         frames
     ):
-        timestamp = index * 0.5
+        # fps=1 nên mỗi khung cách nhau đúng 1 giây.
+        timestamp = index * 1.0
         detected = _ocr_one_frame(frame_path)
 
         if not _is_valid_caption_text(detected):
@@ -932,9 +933,11 @@ def _extract_ocr_items(
             ),
         )
 
+        sample_text = sample["text"]
+
         similarity = _text_similarity(
             representative,
-            sample["text"],
+            sample_text,
         )
 
         gap = (
@@ -942,16 +945,53 @@ def _extract_ocr_items(
             - current["last"]
         )
 
-        if similarity >= 0.74 and gap <= 0.85:
+        representative_chars = set(
+            char for char in representative
+            if "\u4e00" <= char <= "\u9fff"
+        )
+
+        sample_chars = set(
+            char for char in sample_text
+            if "\u4e00" <= char <= "\u9fff"
+        )
+
+        smaller_count = min(
+            len(representative_chars),
+            len(sample_chars),
+        )
+
+        shared_ratio = (
+            len(
+                representative_chars
+                & sample_chars
+            )
+            / smaller_count
+            if smaller_count
+            else 0.0
+        )
+
+        same_caption = (
+            similarity >= 0.42
+            or (
+                smaller_count >= 3
+                and shared_ratio >= 0.55
+            )
+            or representative in sample_text
+            or sample_text in representative
+        )
+
+        # fps=1: cho phép một khung OCR bị hụt,
+        # nhưng không nối các câu cách nhau quá xa.
+        if same_caption and gap <= 1.6:
             current["last"] = sample["time"]
             current["texts"].append(
-                sample["text"]
+                sample_text
             )
         else:
             groups.append({
                 "start": sample["time"],
                 "last": sample["time"],
-                "texts": [sample["text"]],
+                "texts": [sample_text],
             })
 
     items = []
@@ -1030,6 +1070,9 @@ def register_autocap_routes(app) -> None:
             "ocr_vertical_range": "88.5%-99.9%",
             "ocr_horizontal_range": "10%-90%",
             "ocr_language": "chi_sim",
+            "ocr_caption_stabilizer": true,
+            "ocr_frame_interval_seconds": 1.0,
+            "ocr_group_max_gap_seconds": 1.6,
             "subtitle_timing_source": "chinese_speech",
             "dubbing_timing_source": "chinese_speech",
             "translation_source_policy": (
@@ -1441,13 +1484,14 @@ def register_autocap_routes(app) -> None:
                             )
                         )
 
-                # V147J:
-                # OCR cung cấp chữ trên màn hình.
-                # Whisper cung cấp câu nghe từ giọng Trung.
-                # Chỉ dùng OCR khi được Whisper xác nhận.
-                items = _cross_check_translation_sources(
-                    items
-                )
+                # V147M:
+                # OCR ổn định quyết định nội dung cần dịch.
+                # Whisper chỉ hỗ trợ xác định thời điểm nói,
+                # tuyệt đối không thay câu chữ OCR.
+                for item in items:
+                    item["translation_source"] = str(
+                        item.get("source", "")
+                    ).strip()
 
                 translations = _translate_batch([
                     item["translation_source"]
