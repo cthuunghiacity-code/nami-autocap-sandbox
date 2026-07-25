@@ -19,7 +19,7 @@ from fastapi import File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
 
-VERSION = "NAMI_V147I_DIAGNOSTIC_TRANSCRIPT_MODE"
+VERSION = "NAMI_V147J_MULTI_BAND_CHINESE_OCR"
 MAX_UPLOAD_BYTES = 120 * 1024 * 1024
 
 _PROCESS_LOCK = Lock()
@@ -692,10 +692,10 @@ def _normalise_ocr_text(value: str) -> str:
 def _is_valid_caption_text(value: str) -> bool:
     cjk = _cjk_count(value)
 
-    if cjk < 2 or cjk > 34:
+    if cjk < 2 or cjk > 42:
         return False
 
-    if len(value) > 52:
+    if len(value) > 64:
         return False
 
     blocked = (
@@ -719,7 +719,7 @@ def _is_valid_caption_text(value: str) -> bool:
 
     cjk_ratio = cjk / max(1, len(value))
 
-    if cjk_ratio < 0.55:
+    if cjk_ratio < 0.42:
         return False
 
     return True
@@ -741,97 +741,138 @@ def _ocr_one_frame(frame_path: Path) -> str:
     if image is None:
         return ""
 
-    gray = cv2.cvtColor(
-        image,
-        cv2.COLOR_BGR2GRAY,
-    )
+    height, width = image.shape[:2]
 
-    gray = cv2.resize(
-        gray,
-        None,
-        fx=1.5,
-        fy=1.5,
-        interpolation=cv2.INTER_CUBIC,
-    )
-
-    variants = [gray]
-
-    variants.append(
-        cv2.threshold(
-            gray,
-            0,
-            255,
-            cv2.THRESH_BINARY
-            + cv2.THRESH_OTSU,
-        )[1]
-    )
-
-    variants.append(
-        cv2.threshold(
-            gray,
-            0,
-            255,
-            cv2.THRESH_BINARY_INV
-            + cv2.THRESH_OTSU,
-        )[1]
-    )
+    # Tự thử nhiều dải vì mỗi nguồn video đặt phụ đề khác nhau.
+    candidate_bands = [
+        (0.48, 0.68),
+        (0.55, 0.75),
+        (0.62, 0.82),
+        (0.69, 0.89),
+        (0.76, 0.97),
+    ]
 
     best_text = ""
     best_score = -1.0
 
-    for variant in variants:
-        try:
-            data = pytesseract.image_to_data(
-                variant,
-                lang="chi_sim",
-                config="--psm 6",
-                output_type=Output.DICT,
-            )
-        except Exception:
+    for top_ratio, bottom_ratio in candidate_bands:
+        top = max(0, int(height * top_ratio))
+        bottom = min(height, int(height * bottom_ratio))
+        left = max(0, int(width * 0.03))
+        right = min(width, int(width * 0.97))
+
+        crop = image[top:bottom, left:right]
+
+        if crop.size == 0:
             continue
 
-        words = []
-        confidence_total = 0.0
+        gray = cv2.cvtColor(
+            crop,
+            cv2.COLOR_BGR2GRAY,
+        )
 
-        for index, raw in enumerate(
-            data.get("text", [])
-        ):
-            word = _normalise_ocr_text(
-                str(raw or "")
-            )
+        gray = cv2.resize(
+            gray,
+            None,
+            fx=2.2,
+            fy=2.2,
+            interpolation=cv2.INTER_CUBIC,
+        )
 
-            try:
-                confidence = float(
-                    data["conf"][index]
+        blurred = cv2.GaussianBlur(
+            gray,
+            (3, 3),
+            0,
+        )
+
+        variants = [
+            gray,
+            cv2.threshold(
+                blurred,
+                0,
+                255,
+                cv2.THRESH_BINARY
+                + cv2.THRESH_OTSU,
+            )[1],
+            cv2.threshold(
+                blurred,
+                0,
+                255,
+                cv2.THRESH_BINARY_INV
+                + cv2.THRESH_OTSU,
+            )[1],
+            cv2.adaptiveThreshold(
+                blurred,
+                255,
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY,
+                31,
+                9,
+            ),
+        ]
+
+        for variant in variants:
+            for psm in (6, 7, 11):
+                try:
+                    data = pytesseract.image_to_data(
+                        variant,
+                        lang="chi_sim",
+                        config=f"--psm {psm}",
+                        output_type=Output.DICT,
+                    )
+                except Exception:
+                    continue
+
+                words = []
+                confidence_total = 0.0
+
+                for index, raw in enumerate(
+                    data.get("text", [])
+                ):
+                    word = _normalise_ocr_text(
+                        str(raw or "")
+                    )
+
+                    try:
+                        confidence = float(
+                            data["conf"][index]
+                        )
+                    except Exception:
+                        confidence = -1.0
+
+                    if (
+                        confidence >= 10
+                        and _cjk_count(word) >= 1
+                    ):
+                        words.append(word)
+                        confidence_total += max(
+                            confidence,
+                            0.0,
+                        )
+
+                candidate = _normalise_ocr_text(
+                    "".join(words)
                 )
-            except Exception:
-                confidence = -1.0
 
-            if (
-                confidence >= 18
-                and _cjk_count(word) >= 1
-            ):
-                words.append(word)
-                confidence_total += confidence
+                cjk = _cjk_count(candidate)
 
-        candidate = _normalise_ocr_text(
-            "".join(words)
-        )
+                if cjk < 2:
+                    continue
 
-        cjk = _cjk_count(candidate)
+                if not _is_valid_caption_text(
+                    candidate
+                ):
+                    continue
 
-        if not _is_valid_caption_text(candidate):
-            continue
+                score = (
+                    confidence_total
+                    + cjk * 20
+                    + min(len(candidate), 45) * 2
+                )
 
-        score = (
-            confidence_total
-            + cjk * 14
-            + len(candidate)
-        )
-
-        if score > best_score:
-            best_score = score
-            best_text = candidate
+                if score > best_score:
+                    best_score = score
+                    best_text = candidate
 
     return best_text
 
@@ -858,9 +899,7 @@ def _extract_ocr_items(
         str(input_path),
         "-vf",
         (
-            "fps=3,"
-            "crop=iw*0.90:ih*0.19:iw*0.05:ih*0.67,"
-            "scale=iw*2.0:ih*2.0"
+            "fps=3,scale=iw:ih"
         ),
         str(frame_pattern),
     ])
@@ -1001,6 +1040,7 @@ def register_autocap_routes(app) -> None:
             "recognition_primary": "chinese_caption_ocr",
             "recognition_fallback": "whisper",
             "diagnostic_endpoint": "/autocap/diagnose",
+            "ocr_band_mode": "automatic_multi_band",
             "subtitle_timing_source": "chinese_speech",
             "dubbing_timing_source": "chinese_speech",
             "translation_source_policy": (
