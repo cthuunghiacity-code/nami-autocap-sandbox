@@ -14,7 +14,7 @@ from fastapi import File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
 
-VERSION = "NAMI_V147E_CONTEXT_AWARE_TRANSLATION"
+VERSION = "NAMI_V147F_COMPACT_CHINESE_SUBTITLE_OVERLAY"
 MAX_UPLOAD_BYTES = 120 * 1024 * 1024
 
 _PROCESS_LOCK = Lock()
@@ -28,7 +28,7 @@ def _load_whisper():
     with _MODEL_LOCK:
         if _WHISPER_MODEL is None:
             _WHISPER_MODEL = WhisperModel(
-                "base",
+                "tiny",
                 device="cpu",
                 compute_type="int8",
                 cpu_threads=2,
@@ -134,14 +134,17 @@ def _subtitle_filter(path: Path) -> str:
 
     style = (
         "FontName=Arial,"
-        "FontSize=15,"
+        "FontSize=13,"
         "PrimaryColour=&H00FFFFFF,"
+        "BackColour=&H90000000,"
         "OutlineColour=&H00000000,"
-        "BorderStyle=1,"
-        "Outline=2,"
+        "BorderStyle=3,"
+        "Outline=0,"
         "Shadow=0,"
         "Alignment=2,"
-        "MarginV=42"
+        "MarginL=22,"
+        "MarginR=22,"
+        "MarginV=16"
     )
 
     return (
@@ -417,12 +420,8 @@ def register_autocap_routes(app) -> None:
                     language="zh",
                     task="transcribe",
                     vad_filter=True,
-                    beam_size=3,
-                    condition_on_previous_text=True,
-                    initial_prompt=(
-                        "这是中文影视对白，请准确识别人物对话，"
-                        "保留完整句子和自然标点。"
-                    ),
+                    beam_size=1,
+                    condition_on_previous_text=False,
                 )
 
                 items = []
@@ -452,53 +451,20 @@ def register_autocap_routes(app) -> None:
                         ),
                     )
 
-                merged_items = []
-
-                for item in items:
-                    if not merged_items:
-                        merged_items.append(item)
-                        continue
-
-                    previous = merged_items[-1]
-                    gap = item["start"] - previous["end"]
-                    combined = (
-                        previous["source"]
-                        + item["source"]
-                    )
-
-                    previous_duration = (
-                        previous["end"]
-                        - previous["start"]
-                    )
-
-                    should_merge = (
-                        gap <= 0.65
-                        and len(combined) <= 48
-                        and previous_duration <= 7.5
-                    )
-
-                    if should_merge:
-                        previous["source"] = combined
-                        previous["end"] = item["end"]
-                    else:
-                        merged_items.append(item)
-
-                items = merged_items
-
                 translations = _translate_batch([
                     item["source"]
                     for item in items
                 ])
 
-                subtitle_blocks = []
+                compact_items = []
 
-                for index, item in enumerate(
+                for item, vietnamese in zip(
                     items,
-                    start=1,
+                    translations,
                 ):
-                    vietnamese = translations[
-                        index - 1
-                    ]
+                    vietnamese = " ".join(
+                        str(vietnamese or "").split()
+                    ).strip()
 
                     if not vietnamese:
                         vietnamese = (
@@ -506,7 +472,80 @@ def register_autocap_routes(app) -> None:
                         )
 
                     words = vietnamese.split()
-                    wrapped_lines = []
+                    chunks = []
+                    current = ""
+
+                    for word in words:
+                        candidate = (
+                            word
+                            if not current
+                            else current + " " + word
+                        )
+
+                        if len(candidate) <= 58:
+                            current = candidate
+                        else:
+                            if current:
+                                chunks.append(current)
+                            current = word
+
+                    if current:
+                        chunks.append(current)
+
+                    if not chunks:
+                        continue
+
+                    original_start = float(item["start"])
+                    original_end = float(item["end"])
+                    original_duration = max(
+                        1.2,
+                        original_end - original_start,
+                    )
+
+                    chunk_duration = max(
+                        1.2,
+                        min(
+                            4.5,
+                            original_duration
+                            / len(chunks),
+                        ),
+                    )
+
+                    for chunk_index, chunk in enumerate(
+                        chunks
+                    ):
+                        chunk_start = (
+                            original_start
+                            + chunk_index * chunk_duration
+                        )
+
+                        chunk_end = min(
+                            original_end,
+                            chunk_start + chunk_duration,
+                        )
+
+                        if chunk_end <= chunk_start:
+                            chunk_end = chunk_start + 1.2
+
+                        compact_items.append({
+                            "start": chunk_start,
+                            "end": chunk_end,
+                            "source": item["source"],
+                            "vietnamese": chunk,
+                        })
+
+                items = compact_items
+
+                subtitle_blocks = []
+
+                for index, item in enumerate(
+                    items,
+                    start=1,
+                ):
+                    vietnamese = item["vietnamese"]
+                    words = vietnamese.split()
+
+                    lines = []
                     current_line = ""
 
                     for word in words:
@@ -516,29 +555,23 @@ def register_autocap_routes(app) -> None:
                             else current_line + " " + word
                         )
 
-                        if len(candidate) <= 38:
+                        if len(candidate) <= 31:
                             current_line = candidate
                         else:
                             if current_line:
-                                wrapped_lines.append(
-                                    current_line
-                                )
+                                lines.append(current_line)
                             current_line = word
 
                     if current_line:
-                        wrapped_lines.append(current_line)
+                        lines.append(current_line)
 
-                    if len(wrapped_lines) > 2:
-                        wrapped_lines = [
-                            wrapped_lines[0],
-                            " ".join(wrapped_lines[1:]),
+                    if len(lines) > 2:
+                        lines = [
+                            lines[0],
+                            " ".join(lines[1:]),
                         ]
 
-                    display_text = "\n".join(
-                        wrapped_lines
-                    )
-
-                    item["vietnamese"] = vietnamese
+                    display_text = "\\N".join(lines[:2])
 
                     subtitle_blocks.append(
                         f"{index}\n"
