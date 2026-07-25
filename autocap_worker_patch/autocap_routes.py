@@ -19,7 +19,7 @@ from fastapi import File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
 
-VERSION = "NAMI_V147H_STRICT_CHINESE_CAPTION_BAND"
+VERSION = "NAMI_V147I_CHINESE_SPEECH_SYNCED_DUB_AND_SUBTITLE"
 MAX_UPLOAD_BYTES = 120 * 1024 * 1024
 
 _PROCESS_LOCK = Lock()
@@ -83,6 +83,204 @@ def _timestamp(seconds: float) -> str:
         f"{secs:02d},{millis:03d}"
     )
 
+
+
+def _extract_audio_for_sync(
+    input_path: Path,
+    audio_path: Path,
+) -> None:
+    if audio_path.is_file() and audio_path.stat().st_size > 0:
+        return
+
+    _run([
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(input_path),
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        str(audio_path),
+    ])
+
+
+def _detect_chinese_speech_windows(
+    audio_path: Path,
+) -> list[dict]:
+    model = _load_whisper()
+
+    segments, _ = model.transcribe(
+        str(audio_path),
+        language="zh",
+        task="transcribe",
+        vad_filter=True,
+        beam_size=1,
+        condition_on_previous_text=False,
+    )
+
+    windows: list[dict] = []
+
+    for segment in segments:
+        start = max(0.0, float(segment.start))
+        end = max(start + 0.12, float(segment.end))
+        spoken_text = " ".join(
+            str(segment.text or "").split()
+        ).strip()
+
+        windows.append({
+            "start": start,
+            "end": end,
+            "text": spoken_text,
+        })
+
+    return windows
+
+
+def _time_overlap(
+    start_a: float,
+    end_a: float,
+    start_b: float,
+    end_b: float,
+) -> float:
+    return max(
+        0.0,
+        min(end_a, end_b) - max(start_a, start_b),
+    )
+
+
+def _align_ocr_items_to_chinese_speech(
+    items: list[dict],
+    speech_windows: list[dict],
+) -> list[dict]:
+    if not items or not speech_windows:
+        return items
+
+    aligned: list[dict] = []
+    previous_end = 0.0
+    search_from = 0
+
+    for item in items:
+        item_start = float(item["start"])
+        item_end = float(item["end"])
+        item_center = (item_start + item_end) / 2.0
+
+        best_index = None
+        best_score = float("-inf")
+
+        # Tìm cửa sổ giọng Trung gần và trùng thời gian nhất.
+        upper = min(
+            len(speech_windows),
+            search_from + 10,
+        )
+
+        for index in range(search_from, upper):
+            window = speech_windows[index]
+            speech_start = float(window["start"])
+            speech_end = float(window["end"])
+            speech_center = (
+                speech_start + speech_end
+            ) / 2.0
+
+            overlap = _time_overlap(
+                item_start,
+                item_end,
+                speech_start,
+                speech_end,
+            )
+            center_distance = abs(
+                item_center - speech_center
+            )
+
+            score = overlap * 10.0 - center_distance
+
+            if score > best_score:
+                best_score = score
+                best_index = index
+
+        if best_index is None:
+            aligned.append(dict(item))
+            continue
+
+        selected = speech_windows[best_index]
+        speech_start = float(selected["start"])
+        speech_end = float(selected["end"])
+
+        # Không cho câu sau chạy ngược lên câu trước.
+        speech_start = max(
+            speech_start,
+            previous_end,
+        )
+        speech_end = max(
+            speech_start + 0.25,
+            speech_end,
+        )
+
+        updated = dict(item)
+        updated["start"] = speech_start
+        updated["end"] = speech_end
+        updated["speech_sync_source"] = "chinese_audio"
+        updated["recognized_speech"] = str(
+            selected.get("text") or ""
+        )
+
+        aligned.append(updated)
+
+        previous_end = speech_end
+        search_from = min(
+            best_index + 1,
+            len(speech_windows),
+        )
+
+    return aligned
+
+
+def _probe_audio_duration(path: Path) -> float:
+    result = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:"
+            "nokey=1",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    try:
+        return max(
+            0.01,
+            float(result.stdout.strip()),
+        )
+    except Exception:
+        return 0.01
+
+
+def _atempo_chain(speed: float) -> str:
+    speed = max(0.01, float(speed))
+    factors: list[float] = []
+
+    while speed > 2.0:
+        factors.append(2.0)
+        speed /= 2.0
+
+    while speed < 0.5:
+        factors.append(0.5)
+        speed /= 0.5
+
+    factors.append(speed)
+
+    return ",".join(
+        f"atempo={factor:.6f}"
+        for factor in factors
+    )
 
 def _translate_batch(texts: list[str]) -> list[str]:
     translator = GoogleTranslator(
@@ -223,7 +421,7 @@ def _render_subtitle_only(
 def _render_with_dubbing(
     input_path: Path,
     srt_path: Path,
-    voice_files: list[tuple[Path, int]],
+    voice_files: list[tuple[Path, int, int]],
     output_path: Path,
 ) -> None:
     args = [
@@ -233,7 +431,7 @@ def _render_with_dubbing(
         str(input_path),
     ]
 
-    for voice_path, _ in voice_files:
+    for voice_path, _, _ in voice_files:
         args.extend(["-i", str(voice_path)])
 
     filters: list[str] = []
@@ -249,15 +447,38 @@ def _render_with_dubbing(
         )
         mix_labels.append("[original]")
 
-    for index, (_, delay_ms) in enumerate(
+    for index, (
+        voice_path,
+        delay_ms,
+        target_duration_ms,
+    ) in enumerate(
         voice_files,
         start=1,
     ):
         label = f"voice{index}"
 
+        source_duration = _probe_audio_duration(
+            voice_path
+        )
+        target_duration = max(
+            0.25,
+            float(target_duration_ms) / 1000.0,
+        )
+
+        # Nếu câu Việt dài hơn lượt nói Trung,
+        # tăng tốc vừa đúng để không lấn sang câu kế tiếp.
+        speed = max(
+            1.0,
+            source_duration / target_duration,
+        )
+        tempo_filter = _atempo_chain(speed)
+
         filters.append(
             f"[{index}:a]"
             f"aresample=44100,"
+            f"{tempo_filter},"
+            f"atrim=0:{target_duration:.6f},"
+            f"asetpts=PTS-STARTPTS,"
             f"adelay={delay_ms}|{delay_ms},"
             f"volume=1.35"
             f"[{label}]"
@@ -636,6 +857,10 @@ def register_autocap_routes(app) -> None:
             "vietnamese_dubbing_mode": True,
             "recognition_primary": "chinese_caption_ocr",
             "recognition_fallback": "whisper",
+            "subtitle_timing_source": "chinese_speech",
+            "dubbing_timing_source": "chinese_speech",
+            "one_voice_file_per_speech_turn": True,
+            "voice_overlap_prevention": True,
             "voices": {
                 "female": "vi-VN-HoaiMyNeural",
                 "male": "vi-VN-NamMinhNeural",
@@ -794,6 +1019,32 @@ def register_autocap_routes(app) -> None:
                         ),
                     )
 
+                # V147I:
+                # OCR chỉ quyết định nội dung chữ Trung.
+                # Tiếng nói Trung quyết định thời điểm bắt đầu/kết thúc.
+                if (
+                    recognition_source == "ocr"
+                    and _video_has_audio(input_path)
+                ):
+                    _extract_audio_for_sync(
+                        input_path,
+                        audio_path,
+                    )
+
+                    speech_windows = (
+                        _detect_chinese_speech_windows(
+                            audio_path
+                        )
+                    )
+
+                    if speech_windows:
+                        items = (
+                            _align_ocr_items_to_chinese_speech(
+                                items,
+                                speech_windows,
+                            )
+                        )
+
                 translations = _translate_batch([
                     item["source"]
                     for item in items
@@ -950,12 +1201,24 @@ def register_autocap_routes(app) -> None:
                             )
                         )
 
-                        voice_files.append((
-                            voice_path,
+                        start_ms = round(
+                            float(item["start"]) * 1000
+                        )
+                        duration_ms = max(
+                            250,
                             round(
-                                float(item["start"])
+                                (
+                                    float(item["end"])
+                                    - float(item["start"])
+                                )
                                 * 1000
                             ),
+                        )
+
+                        voice_files.append((
+                            voice_path,
+                            start_ms,
+                            duration_ms,
                         ))
 
                     _render_with_dubbing(
