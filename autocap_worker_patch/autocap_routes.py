@@ -19,7 +19,7 @@ from fastapi import File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
 
-VERSION = "NAMI_V147J_OCR_WHISPER_CROSSCHECK_TRANSLATION"
+VERSION = "NAMI_V147I_DIAGNOSTIC_TRANSCRIPT_MODE"
 MAX_UPLOAD_BYTES = 120 * 1024 * 1024
 
 _PROCESS_LOCK = Lock()
@@ -1000,6 +1000,7 @@ def register_autocap_routes(app) -> None:
             "vietnamese_dubbing_mode": True,
             "recognition_primary": "chinese_caption_ocr",
             "recognition_fallback": "whisper",
+            "diagnostic_endpoint": "/autocap/diagnose",
             "subtitle_timing_source": "chinese_speech",
             "dubbing_timing_source": "chinese_speech",
             "translation_source_policy": (
@@ -1015,6 +1016,224 @@ def register_autocap_routes(app) -> None:
             },
             "max_upload_mb": 120,
         }
+
+    @app.post("/autocap/diagnose")
+    def autocap_diagnose(
+        video: UploadFile = File(...),
+        x_nami_key: str | None = Header(
+            default=None,
+            alias="X-NAMI-Key",
+        ),
+    ):
+        _check_owner_key(x_nami_key)
+
+        if not video.filename:
+            raise HTTPException(
+                status_code=400,
+                detail="Missing video filename",
+            )
+
+        with _PROCESS_LOCK:
+            job_dir = Path(
+                tempfile.mkdtemp(
+                    prefix="nami_autocap_diagnostic_"
+                )
+            )
+
+            input_path = job_dir / "input.mp4"
+
+            try:
+                total = 0
+
+                with input_path.open("wb") as output:
+                    while True:
+                        chunk = video.file.read(
+                            1024 * 1024
+                        )
+
+                        if not chunk:
+                            break
+
+                        total += len(chunk)
+
+                        if total > MAX_UPLOAD_BYTES:
+                            raise HTTPException(
+                                status_code=413,
+                                detail=(
+                                    "Video exceeds 120 MB"
+                                ),
+                            )
+
+                        output.write(chunk)
+
+                if total == 0:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Video is empty",
+                    )
+
+                items = _extract_ocr_items(
+                    input_path,
+                    job_dir,
+                )
+
+                recognition_source = "ocr"
+
+                if not items:
+                    recognition_source = (
+                        "whisper_fallback"
+                    )
+
+                    if not _video_has_audio(
+                        input_path
+                    ):
+                        raise HTTPException(
+                            status_code=422,
+                            detail=(
+                                "OCR không đọc được chữ "
+                                "và video không có âm thanh."
+                            ),
+                        )
+
+                    audio_path = job_dir / "audio.wav"
+
+                    _run([
+                        "ffmpeg",
+                        "-y",
+                        "-i",
+                        str(input_path),
+                        "-vn",
+                        "-ac",
+                        "1",
+                        "-ar",
+                        "16000",
+                        str(audio_path),
+                    ])
+
+                    model = _load_whisper()
+
+                    segments, _ = model.transcribe(
+                        str(audio_path),
+                        language="zh",
+                        task="transcribe",
+                        vad_filter=True,
+                        beam_size=1,
+                        condition_on_previous_text=False,
+                    )
+
+                    items = []
+
+                    for segment in segments:
+                        source = " ".join(
+                            segment.text.split()
+                        ).strip()
+
+                        if source:
+                            items.append({
+                                "start": float(
+                                    segment.start
+                                ),
+                                "end": float(
+                                    segment.end
+                                ),
+                                "source": source,
+                            })
+
+                if not items:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            "Không nhận dạng được "
+                            "nội dung tiếng Trung."
+                        ),
+                    )
+
+                translations = _translate_batch([
+                    item["source"]
+                    for item in items
+                ])
+
+                diagnostic_items = []
+
+                for index, item in enumerate(
+                    items,
+                    start=1,
+                ):
+                    source = str(
+                        item.get("source", "")
+                    ).strip()
+
+                    vietnamese = str(
+                        translations[index - 1]
+                        if index - 1 < len(translations)
+                        else ""
+                    ).strip()
+
+                    start = float(
+                        item.get("start", 0.0)
+                    )
+
+                    end = float(
+                        item.get("end", start)
+                    )
+
+                    diagnostic_items.append({
+                        "index": index,
+                        "start_seconds": round(
+                            start,
+                            3,
+                        ),
+                        "end_seconds": round(
+                            end,
+                            3,
+                        ),
+                        "duration_seconds": round(
+                            max(0.0, end - start),
+                            3,
+                        ),
+                        "start_srt": _timestamp(
+                            start
+                        ),
+                        "end_srt": _timestamp(
+                            end
+                        ),
+                        "source_zh": source,
+                        "translation_vi": vietnamese,
+                        "cjk_count": _cjk_count(
+                            source
+                        ),
+                        "source_length": len(
+                            source
+                        ),
+                        "valid_caption": (
+                            _is_valid_caption_text(
+                                source
+                            )
+                            if recognition_source == "ocr"
+                            else True
+                        ),
+                    })
+
+                return {
+                    "ok": True,
+                    "version": VERSION,
+                    "filename": video.filename,
+                    "recognition_source": (
+                        recognition_source
+                    ),
+                    "item_count": len(
+                        diagnostic_items
+                    ),
+                    "rendered_video": False,
+                    "dubbing_created": False,
+                    "items": diagnostic_items,
+                }
+
+            finally:
+                shutil.rmtree(
+                    job_dir,
+                    ignore_errors=True,
+                )
 
     @app.post("/autocap/process")
     def autocap_process(
