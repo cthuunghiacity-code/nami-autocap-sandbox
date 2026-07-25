@@ -1070,16 +1070,14 @@ def register_autocap_routes(app) -> None:
             "ocr_vertical_range": "88.5%-99.9%",
             "ocr_horizontal_range": "10%-90%",
             "ocr_language": "chi_sim",
-            "ocr_caption_stabilizer": true,
+            "ocr_caption_stabilizer": True,
             "ocr_frame_interval_seconds": 1.0,
             "ocr_group_max_gap_seconds": 1.6,
             "subtitle_timing_source": "chinese_speech",
             "dubbing_timing_source": "chinese_speech",
-            "translation_source_policy": (
-                "ocr_confirmed_by_whisper"
-            ),
-            "ocr_whisper_crosscheck": True,
-            "mismatched_ocr_replacement": True,
+            "translation_source_policy": "stabilized_ocr_only",
+            "ocr_whisper_crosscheck": False,
+            "mismatched_ocr_replacement": False,
             "one_voice_file_per_speech_turn": True,
             "voice_overlap_prevention": True,
             "voices": {
