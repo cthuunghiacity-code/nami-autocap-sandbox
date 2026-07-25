@@ -19,7 +19,7 @@ from fastapi import File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
 
-VERSION = "NAMI_V147G_CHINESE_CAPTION_OCR_PRIMARY"
+VERSION = "NAMI_V147H_STRICT_CHINESE_CAPTION_BAND"
 MAX_UPLOAD_BYTES = 120 * 1024 * 1024
 
 _PROCESS_LOCK = Lock()
@@ -139,7 +139,7 @@ def _subtitle_filter(path: Path) -> str:
 
     style = (
         "FontName=Arial,"
-        "FontSize=13,"
+        "FontSize=12,"
         "PrimaryColour=&H00FFFFFF,"
         "BackColour=&H90000000,"
         "OutlineColour=&H00000000,"
@@ -149,7 +149,7 @@ def _subtitle_filter(path: Path) -> str:
         "Alignment=2,"
         "MarginL=22,"
         "MarginR=22,"
-        "MarginV=16"
+        "MarginV=22"
     )
 
     return (
@@ -324,6 +324,42 @@ def _normalise_ocr_text(value: str) -> str:
     return value[:100]
 
 
+
+def _is_valid_caption_text(value: str) -> bool:
+    cjk = _cjk_count(value)
+
+    if cjk < 2 or cjk > 34:
+        return False
+
+    if len(value) > 52:
+        return False
+
+    blocked = (
+        "抖音",
+        "快手",
+        "关注",
+        "点赞",
+        "评论",
+        "字幕组",
+        "版权所有",
+        "原创",
+        "直播",
+        "主页",
+    )
+
+    if any(token in value for token in blocked):
+        return False
+
+    if re.search(r"([\u3400-\u9fff])\1{3,}", value):
+        return False
+
+    cjk_ratio = cjk / max(1, len(value))
+
+    if cjk_ratio < 0.55:
+        return False
+
+    return True
+
 def _text_similarity(left: str, right: str) -> float:
     if not left or not right:
         return 0.0
@@ -420,7 +456,7 @@ def _ocr_one_frame(frame_path: Path) -> str:
 
         cjk = _cjk_count(candidate)
 
-        if cjk < 2:
+        if not _is_valid_caption_text(candidate):
             continue
 
         score = (
@@ -458,9 +494,9 @@ def _extract_ocr_items(
         str(input_path),
         "-vf",
         (
-            "fps=2,"
-            "crop=iw:ih*0.42:0:ih*0.50,"
-            "scale=iw*1.5:ih*1.5"
+            "fps=3,"
+            "crop=iw*0.90:ih*0.19:iw*0.05:ih*0.67,"
+            "scale=iw*2.0:ih*2.0"
         ),
         str(frame_pattern),
     ])
@@ -477,7 +513,7 @@ def _extract_ocr_items(
         timestamp = index * 0.5
         detected = _ocr_one_frame(frame_path)
 
-        if _cjk_count(detected) < 2:
+        if not _is_valid_caption_text(detected):
             continue
 
         samples.append({
@@ -519,7 +555,7 @@ def _extract_ocr_items(
             - current["last"]
         )
 
-        if similarity >= 0.62 and gap <= 1.1:
+        if similarity >= 0.74 and gap <= 0.85:
             current["last"] = sample["time"]
             current["texts"].append(
                 sample["text"]
@@ -542,7 +578,7 @@ def _extract_ocr_items(
             ),
         )
 
-        if _cjk_count(source) < 2:
+        if not _is_valid_caption_text(source):
             continue
 
         if index + 1 < len(groups):
@@ -564,8 +600,8 @@ def _extract_ocr_items(
             ),
         )
 
-        if end - start > 7.0:
-            end = start + 7.0
+        if end - start > 4.8:
+            end = start + 4.8
 
         if (
             items
