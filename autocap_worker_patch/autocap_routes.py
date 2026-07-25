@@ -19,7 +19,7 @@ from fastapi import File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
 
-VERSION = "NAMI_V147I_CHINESE_SPEECH_SYNCED_DUB_AND_SUBTITLE"
+VERSION = "NAMI_V147J_OCR_WHISPER_CROSSCHECK_TRANSLATION"
 MAX_UPLOAD_BYTES = 120 * 1024 * 1024
 
 _PROCESS_LOCK = Lock()
@@ -149,6 +149,149 @@ def _time_overlap(
         min(end_a, end_b) - max(start_a, start_b),
     )
 
+
+
+def _han_only(value: str) -> str:
+    return "".join(
+        character
+        for character in str(value or "")
+        if (
+            "\u3400" <= character <= "\u4dbf"
+            or "\u4e00" <= character <= "\u9fff"
+        )
+    )
+
+
+def _chinese_source_similarity(
+    ocr_text: str,
+    speech_text: str,
+) -> float:
+    ocr_han = _han_only(ocr_text)
+    speech_han = _han_only(speech_text)
+
+    if not ocr_han or not speech_han:
+        return 0.0
+
+    sequence_score = SequenceMatcher(
+        None,
+        ocr_han,
+        speech_han,
+    ).ratio()
+
+    ocr_chars = set(ocr_han)
+    speech_chars = set(speech_han)
+    shared = len(ocr_chars & speech_chars)
+
+    coverage_score = shared / max(
+        1,
+        min(len(ocr_chars), len(speech_chars)),
+    )
+
+    length_score = min(
+        len(ocr_han),
+        len(speech_han),
+    ) / max(
+        len(ocr_han),
+        len(speech_han),
+    )
+
+    return (
+        sequence_score * 0.60
+        + coverage_score * 0.30
+        + length_score * 0.10
+    )
+
+
+def _select_chinese_translation_source(
+    item: dict,
+) -> dict:
+    updated = dict(item)
+
+    ocr_text = " ".join(
+        str(item.get("source") or "").split()
+    ).strip()
+
+    speech_text = " ".join(
+        str(
+            item.get("recognized_speech") or ""
+        ).split()
+    ).strip()
+
+    ocr_han = _han_only(ocr_text)
+    speech_han = _han_only(speech_text)
+
+    updated["ocr_source"] = ocr_text
+    updated["whisper_source"] = speech_text
+
+    if not speech_han:
+        updated["translation_source"] = ocr_text
+        updated["source_selection"] = (
+            "ocr_no_valid_whisper"
+        )
+        updated["source_similarity"] = 1.0
+        return updated
+
+    if not ocr_han:
+        updated["translation_source"] = speech_text
+        updated["source_selection"] = (
+            "whisper_invalid_ocr"
+        )
+        updated["source_similarity"] = 0.0
+        return updated
+
+    similarity = _chinese_source_similarity(
+        ocr_text,
+        speech_text,
+    )
+
+    updated["source_similarity"] = round(
+        similarity,
+        4,
+    )
+
+    short_pair = (
+        len(ocr_han) <= 4
+        and len(speech_han) <= 4
+    )
+
+    has_shared_character = bool(
+        set(ocr_han) & set(speech_han)
+    )
+
+    # OCR thường giữ đúng chữ tên riêng và dấu câu hơn
+    # khi hai nguồn thật sự khớp.
+    use_ocr = (
+        similarity >= 0.48
+        or (
+            short_pair
+            and has_shared_character
+            and similarity >= 0.32
+        )
+    )
+
+    if use_ocr:
+        updated["translation_source"] = ocr_text
+        updated["source_selection"] = (
+            "ocr_confirmed_by_whisper"
+        )
+    else:
+        # Hai nguồn lệch mạnh: không được đem OCR sai
+        # như “八个国家”, “综合”, “和二加一” đi dịch.
+        updated["translation_source"] = speech_text
+        updated["source_selection"] = (
+            "whisper_replaced_mismatched_ocr"
+        )
+
+    return updated
+
+
+def _cross_check_translation_sources(
+    items: list[dict],
+) -> list[dict]:
+    return [
+        _select_chinese_translation_source(item)
+        for item in items
+    ]
 
 def _align_ocr_items_to_chinese_speech(
     items: list[dict],
@@ -859,6 +1002,11 @@ def register_autocap_routes(app) -> None:
             "recognition_fallback": "whisper",
             "subtitle_timing_source": "chinese_speech",
             "dubbing_timing_source": "chinese_speech",
+            "translation_source_policy": (
+                "ocr_confirmed_by_whisper"
+            ),
+            "ocr_whisper_crosscheck": True,
+            "mismatched_ocr_replacement": True,
             "one_voice_file_per_speech_turn": True,
             "voice_overlap_prevention": True,
             "voices": {
@@ -1045,8 +1193,16 @@ def register_autocap_routes(app) -> None:
                             )
                         )
 
+                # V147J:
+                # OCR cung cấp chữ trên màn hình.
+                # Whisper cung cấp câu nghe từ giọng Trung.
+                # Chỉ dùng OCR khi được Whisper xác nhận.
+                items = _cross_check_translation_sources(
+                    items
+                )
+
                 translations = _translate_batch([
-                    item["source"]
+                    item["translation_source"]
                     for item in items
                 ])
 
