@@ -74,6 +74,13 @@ jobs:
                       "requirements.txt"
                   ),
               ),
+              CommitOperationAdd(
+                  path_in_repo="Dockerfile",
+                  path_or_fileobj=(
+                      "autocap_worker_patch/"
+                      "Dockerfile"
+                  ),
+              ),
           ]
 
           api.create_commit(

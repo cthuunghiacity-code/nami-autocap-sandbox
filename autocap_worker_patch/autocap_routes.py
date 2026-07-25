@@ -5,6 +5,10 @@ import os
 import shutil
 import subprocess
 import tempfile
+import cv2
+import pytesseract
+from difflib import SequenceMatcher
+from pytesseract import Output
 from pathlib import Path
 from threading import Lock
 
@@ -14,7 +18,7 @@ from fastapi import File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
 
-VERSION = "NAMI_V147F_COMPACT_CHINESE_SUBTITLE_OVERLAY"
+VERSION = "NAMI_V147G_CHINESE_CAPTION_OCR_PRIMARY"
 MAX_UPLOAD_BYTES = 120 * 1024 * 1024
 
 _PROCESS_LOCK = Lock()
@@ -298,6 +302,291 @@ def _render_with_dubbing(
     ])
 
 
+
+def _cjk_count(value: str) -> int:
+    return sum(
+        1
+        for char in value
+        if "\u3400" <= char <= "\u9fff"
+    )
+
+
+def _normalise_ocr_text(value: str) -> str:
+    value = " ".join(value.split()).strip()
+
+    value = re.sub(
+        r"[^\u3400-\u9fffA-Za-z0-9，。！？：；、]",
+        "",
+        value,
+    )
+
+    return value[:100]
+
+
+def _text_similarity(left: str, right: str) -> float:
+    if not left or not right:
+        return 0.0
+
+    return SequenceMatcher(
+        None,
+        left,
+        right,
+    ).ratio()
+
+
+def _ocr_one_frame(frame_path: Path) -> str:
+    image = cv2.imread(str(frame_path))
+
+    if image is None:
+        return ""
+
+    gray = cv2.cvtColor(
+        image,
+        cv2.COLOR_BGR2GRAY,
+    )
+
+    gray = cv2.resize(
+        gray,
+        None,
+        fx=1.5,
+        fy=1.5,
+        interpolation=cv2.INTER_CUBIC,
+    )
+
+    variants = [gray]
+
+    variants.append(
+        cv2.threshold(
+            gray,
+            0,
+            255,
+            cv2.THRESH_BINARY
+            + cv2.THRESH_OTSU,
+        )[1]
+    )
+
+    variants.append(
+        cv2.threshold(
+            gray,
+            0,
+            255,
+            cv2.THRESH_BINARY_INV
+            + cv2.THRESH_OTSU,
+        )[1]
+    )
+
+    best_text = ""
+    best_score = -1.0
+
+    for variant in variants:
+        try:
+            data = pytesseract.image_to_data(
+                variant,
+                lang="chi_sim",
+                config="--psm 6",
+                output_type=Output.DICT,
+            )
+        except Exception:
+            continue
+
+        words = []
+        confidence_total = 0.0
+
+        for index, raw in enumerate(
+            data.get("text", [])
+        ):
+            word = _normalise_ocr_text(
+                str(raw or "")
+            )
+
+            try:
+                confidence = float(
+                    data["conf"][index]
+                )
+            except Exception:
+                confidence = -1.0
+
+            if (
+                confidence >= 18
+                and _cjk_count(word) >= 1
+            ):
+                words.append(word)
+                confidence_total += confidence
+
+        candidate = _normalise_ocr_text(
+            "".join(words)
+        )
+
+        cjk = _cjk_count(candidate)
+
+        if cjk < 2:
+            continue
+
+        score = (
+            confidence_total
+            + cjk * 14
+            + len(candidate)
+        )
+
+        if score > best_score:
+            best_score = score
+            best_text = candidate
+
+    return best_text
+
+
+def _extract_ocr_items(
+    input_path: Path,
+    job_dir: Path,
+) -> list[dict]:
+    frames_dir = job_dir / "ocr_frames"
+
+    frames_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    frame_pattern = (
+        frames_dir / "frame_%06d.png"
+    )
+
+    _run([
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(input_path),
+        "-vf",
+        (
+            "fps=2,"
+            "crop=iw:ih*0.42:0:ih*0.50,"
+            "scale=iw*1.5:ih*1.5"
+        ),
+        str(frame_pattern),
+    ])
+
+    frames = sorted(
+        frames_dir.glob("frame_*.png")
+    )
+
+    samples = []
+
+    for index, frame_path in enumerate(
+        frames
+    ):
+        timestamp = index * 0.5
+        detected = _ocr_one_frame(frame_path)
+
+        if _cjk_count(detected) < 2:
+            continue
+
+        samples.append({
+            "time": timestamp,
+            "text": detected,
+        })
+
+    if not samples:
+        return []
+
+    groups = []
+
+    for sample in samples:
+        if not groups:
+            groups.append({
+                "start": sample["time"],
+                "last": sample["time"],
+                "texts": [sample["text"]],
+            })
+            continue
+
+        current = groups[-1]
+
+        representative = max(
+            current["texts"],
+            key=lambda value: (
+                _cjk_count(value),
+                len(value),
+            ),
+        )
+
+        similarity = _text_similarity(
+            representative,
+            sample["text"],
+        )
+
+        gap = (
+            sample["time"]
+            - current["last"]
+        )
+
+        if similarity >= 0.62 and gap <= 1.1:
+            current["last"] = sample["time"]
+            current["texts"].append(
+                sample["text"]
+            )
+        else:
+            groups.append({
+                "start": sample["time"],
+                "last": sample["time"],
+                "texts": [sample["text"]],
+            })
+
+    items = []
+
+    for index, group in enumerate(groups):
+        source = max(
+            group["texts"],
+            key=lambda value: (
+                _cjk_count(value),
+                len(value),
+            ),
+        )
+
+        if _cjk_count(source) < 2:
+            continue
+
+        if index + 1 < len(groups):
+            next_start = float(
+                groups[index + 1]["start"]
+            )
+        else:
+            next_start = (
+                float(group["last"]) + 1.0
+            )
+
+        start = float(group["start"])
+
+        end = min(
+            next_start,
+            max(
+                start + 0.8,
+                float(group["last"]) + 0.7,
+            ),
+        )
+
+        if end - start > 7.0:
+            end = start + 7.0
+
+        if (
+            items
+            and _text_similarity(
+                items[-1]["source"],
+                source,
+            ) >= 0.88
+        ):
+            items[-1]["end"] = max(
+                items[-1]["end"],
+                end,
+            )
+            continue
+
+        items.append({
+            "start": start,
+            "end": end,
+            "source": source,
+        })
+
+    return items
+
 def register_autocap_routes(app) -> None:
     @app.get("/autocap/health")
     def autocap_health():
@@ -308,6 +597,8 @@ def register_autocap_routes(app) -> None:
             "heavy_work_on_phone": False,
             "subtitle_mode": True,
             "vietnamese_dubbing_mode": True,
+            "recognition_primary": "chinese_caption_ocr",
+            "recognition_fallback": "whisper",
             "voices": {
                 "female": "vi-VN-HoaiMyNeural",
                 "male": "vi-VN-NamMinhNeural",
@@ -391,63 +682,78 @@ def register_autocap_routes(app) -> None:
                         detail="Video is empty",
                     )
 
-                if not _video_has_audio(input_path):
-                    raise HTTPException(
-                        status_code=422,
-                        detail=(
-                            "Video không có âm thanh "
-                            "để nhận dạng lời nói."
-                        ),
-                    )
-
-                _run([
-                    "ffmpeg",
-                    "-y",
-                    "-i",
-                    str(input_path),
-                    "-vn",
-                    "-ac",
-                    "1",
-                    "-ar",
-                    "16000",
-                    str(audio_path),
-                ])
-
-                model = _load_whisper()
-
-                segments, _ = model.transcribe(
-                    str(audio_path),
-                    language="zh",
-                    task="transcribe",
-                    vad_filter=True,
-                    beam_size=1,
-                    condition_on_previous_text=False,
+                items = _extract_ocr_items(
+                    input_path,
+                    job_dir,
                 )
 
-                items = []
+                recognition_source = "ocr"
 
-                for segment in segments:
-                    source = " ".join(
-                        segment.text.split()
-                    ).strip()
+                if len(items) < 2:
+                    recognition_source = (
+                        "whisper_fallback"
+                    )
 
-                    if source:
-                        items.append({
-                            "start": float(
-                                segment.start
+                    if not _video_has_audio(
+                        input_path
+                    ):
+                        raise HTTPException(
+                            status_code=422,
+                            detail=(
+                                "OCR không đọc được "
+                                "phụ đề Trung và video "
+                                "không có âm thanh."
                             ),
-                            "end": float(
-                                segment.end
-                            ),
-                            "source": source,
-                        })
+                        )
+
+                    _run([
+                        "ffmpeg",
+                        "-y",
+                        "-i",
+                        str(input_path),
+                        "-vn",
+                        "-ac",
+                        "1",
+                        "-ar",
+                        "16000",
+                        str(audio_path),
+                    ])
+
+                    model = _load_whisper()
+
+                    segments, _ = model.transcribe(
+                        str(audio_path),
+                        language="zh",
+                        task="transcribe",
+                        vad_filter=True,
+                        beam_size=1,
+                        condition_on_previous_text=False,
+                    )
+
+                    items = []
+
+                    for segment in segments:
+                        source = " ".join(
+                            segment.text.split()
+                        ).strip()
+
+                        if source:
+                            items.append({
+                                "start": float(
+                                    segment.start
+                                ),
+                                "end": float(
+                                    segment.end
+                                ),
+                                "source": source,
+                            })
 
                 if not items:
                     raise HTTPException(
                         status_code=422,
                         detail=(
-                            "Không nhận dạng được "
-                            "lời nói tiếng Trung."
+                            "Không đọc được "
+                            "phụ đề tiếng Trung."
                         ),
                     )
 
