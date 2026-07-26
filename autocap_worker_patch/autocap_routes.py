@@ -24,7 +24,7 @@ from fastapi import File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
 
-VERSION = "NAMI_V147P_RAPIDOCR_GARBAGE_FILTER"
+VERSION = "NAMI_V147Q_CHUNKED_VIETNAMESE_DUBBING"
 MAX_UPLOAD_BYTES = 120 * 1024 * 1024
 
 _PROCESS_LOCK = Lock()
@@ -566,34 +566,86 @@ def _render_subtitle_only(
     _run(args)
 
 
-def _render_with_dubbing(
-    input_path: Path,
-    srt_path: Path,
+async def _create_voice_batch(
+    jobs: list[tuple[str, Path, str]],
+    concurrency: int = 4,
+) -> None:
+    semaphore = asyncio.Semaphore(
+        max(1, concurrency)
+    )
+
+    async def run_one(
+        text: str,
+        output_path: Path,
+        voice: str,
+    ) -> None:
+        async with semaphore:
+            last_error = None
+
+            for attempt in range(3):
+                try:
+                    await _create_voice(
+                        text,
+                        output_path,
+                        voice,
+                    )
+
+                    if (
+                        output_path.is_file()
+                        and output_path.stat().st_size > 0
+                    ):
+                        return
+
+                    raise RuntimeError(
+                        "TTS output is empty"
+                    )
+                except Exception as exc:
+                    last_error = exc
+
+                    await asyncio.sleep(
+                        1.0 + attempt * 1.5
+                    )
+
+            raise RuntimeError(
+                "Vietnamese TTS failed after retries: "
+                + str(last_error)
+            )
+
+    await asyncio.gather(*[
+        run_one(
+            text,
+            output_path,
+            voice,
+        )
+        for text, output_path, voice in jobs
+    ])
+
+
+def _render_voice_batch_track(
     voice_files: list[tuple[Path, int, int]],
     output_path: Path,
+    total_duration: float,
 ) -> None:
     args = [
         "ffmpeg",
         "-y",
+        "-f",
+        "lavfi",
+        "-t",
+        f"{total_duration:.6f}",
         "-i",
-        str(input_path),
+        "anullsrc=channel_layout=stereo:"
+        "sample_rate=44100",
     ]
 
     for voice_path, _, _ in voice_files:
-        args.extend(["-i", str(voice_path)])
+        args.extend([
+            "-i",
+            str(voice_path),
+        ])
 
     filters: list[str] = []
-    mix_labels: list[str] = []
-
-    if _video_has_audio(input_path):
-        filters.append("[0:a]volume=0.16[original]")
-        mix_labels.append("[original]")
-    else:
-        filters.append(
-            "anullsrc=channel_layout=stereo:"
-            "sample_rate=44100[original]"
-        )
-        mix_labels.append("[original]")
+    mix_labels = ["[0:a]"]
 
     for index, (
         voice_path,
@@ -603,23 +655,22 @@ def _render_with_dubbing(
         voice_files,
         start=1,
     ):
-        label = f"voice{index}"
-
         source_duration = _probe_audio_duration(
             voice_path
         )
+
         target_duration = max(
             0.25,
             float(target_duration_ms) / 1000.0,
         )
 
-        # Nếu câu Việt dài hơn lượt nói Trung,
-        # tăng tốc vừa đúng để không lấn sang câu kế tiếp.
         speed = max(
             1.0,
             source_duration / target_duration,
         )
+
         tempo_filter = _atempo_chain(speed)
+        label = f"voice{index}"
 
         filters.append(
             f"[{index}:a]"
@@ -634,15 +685,133 @@ def _render_with_dubbing(
 
         mix_labels.append(f"[{label}]")
 
-    mix_inputs = "".join(mix_labels)
+    filters.append(
+        "".join(mix_labels)
+        + f"amix=inputs={len(mix_labels)}:"
+        + "duration=first:"
+        + "dropout_transition=0:"
+        + "normalize=0"
+        + "[batchmixed]"
+    )
+
+    _run([
+        *args,
+        "-filter_complex",
+        ";".join(filters),
+        "-map",
+        "[batchmixed]",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        "-t",
+        f"{total_duration:.6f}",
+        str(output_path),
+    ])
+
+
+def _render_with_dubbing(
+    input_path: Path,
+    srt_path: Path,
+    voice_files: list[tuple[Path, int, int]],
+    output_path: Path,
+) -> None:
+    if not voice_files:
+        _render_subtitle_only(
+            input_path,
+            srt_path,
+            output_path,
+        )
+        return
+
+    total_duration = max(
+        0.5,
+        _probe_audio_duration(input_path),
+    )
+
+    batch_size = 10
+    batch_tracks: list[Path] = []
+
+    for batch_index, start in enumerate(
+        range(0, len(voice_files), batch_size),
+        start=1,
+    ):
+        batch = voice_files[
+            start:start + batch_size
+        ]
+
+        batch_path = (
+            output_path.parent
+            / f"dub_batch_{batch_index:03d}.m4a"
+        )
+
+        _render_voice_batch_track(
+            batch,
+            batch_path,
+            total_duration,
+        )
+
+        batch_tracks.append(batch_path)
+
+        for voice_path, _, _ in batch:
+            try:
+                voice_path.unlink()
+            except Exception:
+                pass
+
+    args = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(input_path),
+    ]
+
+    for batch_path in batch_tracks:
+        args.extend([
+            "-i",
+            str(batch_path),
+        ])
+
+    filters: list[str] = []
+    mix_labels: list[str] = []
+
+    if _video_has_audio(input_path):
+        filters.append(
+            "[0:a]"
+            "volume=0.14,"
+            "aresample=44100"
+            "[original]"
+        )
+    else:
+        filters.append(
+            "anullsrc=channel_layout=stereo:"
+            "sample_rate=44100"
+            "[original]"
+        )
+
+    mix_labels.append("[original]")
+
+    for index in range(
+        1,
+        len(batch_tracks) + 1,
+    ):
+        label = f"batch{index}"
+
+        filters.append(
+            f"[{index}:a]"
+            f"aresample=44100"
+            f"[{label}]"
+        )
+
+        mix_labels.append(f"[{label}]")
 
     filters.append(
-        f"{mix_inputs}"
-        f"amix=inputs={len(mix_labels)}:"
-        f"duration=first:"
-        f"dropout_transition=0:"
-        f"normalize=0"
-        f"[mixed]"
+        "".join(mix_labels)
+        + f"amix=inputs={len(mix_labels)}:"
+        + "duration=first:"
+        + "dropout_transition=0:"
+        + "normalize=0"
+        + "[mixed]"
     )
 
     _run([
@@ -670,6 +839,12 @@ def _render_with_dubbing(
         "-shortest",
         str(output_path),
     ])
+
+    for batch_path in batch_tracks:
+        try:
+            batch_path.unlink()
+        except Exception:
+            pass
 
 
 
@@ -1227,6 +1402,11 @@ def register_autocap_routes(app) -> None:
             "mismatched_ocr_replacement": False,
             "one_voice_file_per_speech_turn": True,
             "voice_overlap_prevention": True,
+            "dubbing_batch_size": 10,
+            "tts_batch_size": 8,
+            "tts_concurrency": 4,
+            "tts_retry_count": 3,
+            "original_audio_volume": 0.14,
             "voices": {
                 "female": "vi-VN-HoaiMyNeural",
                 "male": "vi-VN-NamMinhNeural",
@@ -1774,6 +1954,7 @@ def register_autocap_routes(app) -> None:
 
                 if mode == "dub":
                     voice_files = []
+                    tts_jobs = []
 
                     for index, item in enumerate(
                         items,
@@ -1784,19 +1965,16 @@ def register_autocap_routes(app) -> None:
                             / f"voice_{index:04d}.mp3"
                         )
 
-                        asyncio.run(
-                            _create_voice(
-                                str(
-                                    item["vietnamese"]
-                                ),
-                                voice_path,
-                                voice,
-                            )
-                        )
+                        tts_jobs.append((
+                            str(item["vietnamese"]),
+                            voice_path,
+                            voice,
+                        ))
 
                         start_ms = round(
                             float(item["start"]) * 1000
                         )
+
                         duration_ms = max(
                             250,
                             round(
@@ -1813,6 +1991,25 @@ def register_autocap_routes(app) -> None:
                             start_ms,
                             duration_ms,
                         ))
+
+                    # Tạo giọng từng cụm nhỏ, tối đa
+                    # bốn kết nối TTS chạy đồng thời.
+                    tts_batch_size = 8
+
+                    for start in range(
+                        0,
+                        len(tts_jobs),
+                        tts_batch_size,
+                    ):
+                        asyncio.run(
+                            _create_voice_batch(
+                                tts_jobs[
+                                    start:
+                                    start + tts_batch_size
+                                ],
+                                concurrency=4,
+                            )
+                        )
 
                     _render_with_dubbing(
                         input_path,
