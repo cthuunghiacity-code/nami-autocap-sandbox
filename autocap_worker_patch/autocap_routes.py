@@ -19,7 +19,7 @@ from fastapi import File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
 
-VERSION = "NAMI_V147M_STABLE_CAPTION_SENTENCE_OCR"
+VERSION = "NAMI_V147N_EXACT_BOTTOM_CHINESE_LINE_OCR"
 MAX_UPLOAD_BYTES = 120 * 1024 * 1024
 
 _PROCESS_LOCK = Lock()
@@ -744,11 +744,11 @@ def _ocr_one_frame(frame_path: Path) -> str:
     height, width = image.shape[:2]
 
     # Tự thử nhiều dải vì mỗi nguồn video đặt phụ đề khác nhau.
-    # Video nguồn có dòng Việt ở phía trên và chữ Trung sát đáy.
-    # Chỉ quét dải thấp nhất để tránh OCR lẫn tiếng Việt.
+    # Khung 1280x720 đã kiểm tra:
+    # tiếng Việt nằm phía trên; chữ Trung chỉ ở sát đáy.
+    # Chỉ giữ đúng dòng Trung, không đưa dòng Việt vào OCR.
     candidate_bands = [
-        (0.885, 0.975),
-        (0.905, 0.999),
+        (0.915, 0.999),
     ]
 
     best_text = ""
@@ -757,8 +757,8 @@ def _ocr_one_frame(frame_path: Path) -> str:
     for top_ratio, bottom_ratio in candidate_bands:
         top = max(0, int(height * top_ratio))
         bottom = min(height, int(height * bottom_ratio))
-        left = max(0, int(width * 0.10))
-        right = min(width, int(width * 0.90))
+        left = max(0, int(width * 0.04))
+        right = min(width, int(width * 0.96))
 
         crop = image[top:bottom, left:right]
 
@@ -1064,12 +1064,14 @@ def register_autocap_routes(app) -> None:
             "recognition_primary": "chinese_caption_ocr",
             "recognition_fallback": "whisper",
             "diagnostic_endpoint": "/autocap/diagnose",
-            "ocr_band_mode": "bottom_chinese_only",
+            "ocr_band_mode": "exact_bottom_chinese_line",
             "ocr_sampling_fps": 1,
-            "ocr_candidate_bands": 2,
-            "ocr_vertical_range": "88.5%-99.9%",
-            "ocr_horizontal_range": "10%-90%",
+            "ocr_candidate_bands": 1,
+            "ocr_vertical_range": "91.5%-99.9%",
+            "ocr_horizontal_range": "4%-96%",
             "ocr_language": "chi_sim",
+            "vietnamese_line_excluded": True,
+            "ocr_text_line_count": 1,
             "ocr_caption_stabilizer": True,
             "ocr_frame_interval_seconds": 1.0,
             "ocr_group_max_gap_seconds": 1.6,
