@@ -24,7 +24,7 @@ from fastapi import File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
 
-VERSION = "NAMI_V147O_RAPIDOCR_CHINESE_CAPTIONS"
+VERSION = "NAMI_V147P_RAPIDOCR_GARBAGE_FILTER"
 MAX_UPLOAD_BYTES = 120 * 1024 * 1024
 
 _PROCESS_LOCK = Lock()
@@ -939,6 +939,64 @@ def _ocr_one_frame(frame_path: Path) -> str:
     )
 
 
+def _is_high_quality_chinese_caption(
+    value: str,
+) -> bool:
+    text = _normalise_ocr_text(
+        str(value or "")
+    )
+
+    if not _is_valid_caption_text(text):
+        return False
+
+    cjk = _cjk_count(text)
+
+    latin_count = sum(
+        char.isascii() and char.isalpha()
+        for char in text
+    )
+
+    digit_count = sum(
+        char.isdigit()
+        for char in text
+    )
+
+    meaningful_count = sum(
+        char.isalnum()
+        or "\u4e00" <= char <= "\u9fff"
+        for char in text
+    )
+
+    cjk_ratio = (
+        cjk / meaningful_count
+        if meaningful_count
+        else 0.0
+    )
+
+    # RapidOCR đôi khi đọc chữ hiệu ứng hoặc watermark
+    # thành chuỗi trộn chữ Latin như "An", "PK", "VIP".
+    if latin_count > 0:
+        return False
+
+    # Loại các mảnh ngắn có số chen giữa như:
+    # "及1一个上", "1怕二让人的".
+    if digit_count > 0 and cjk < 6:
+        return False
+
+    if digit_count > 1:
+        return False
+
+    # Câu Trung bình thường phải chủ yếu là chữ Hán.
+    if cjk_ratio < 0.78:
+        return False
+
+    # Vẫn giữ câu ngắn hợp lệ như 快走, 救命, 别开.
+    if cjk < 2:
+        return False
+
+    return True
+
+
 def _extract_ocr_items(
     input_path: Path,
     job_dir: Path,
@@ -1083,7 +1141,9 @@ def _extract_ocr_items(
             ),
         )
 
-        if not _is_valid_caption_text(source):
+        if not _is_high_quality_chinese_caption(
+            source
+        ):
             continue
 
         if index + 1 < len(groups):
@@ -1151,6 +1211,10 @@ def register_autocap_routes(app) -> None:
             "ocr_engine_primary": "rapidocr_onnxruntime",
             "ocr_engine_fallback": "tesseract_chi_sim",
             "ocr_upscale_factor": 4.0,
+            "ocr_garbage_filter": True,
+            "reject_latin_mixed_text": True,
+            "reject_short_digit_mixed_text": True,
+            "minimum_cjk_ratio": 0.78,
             "vietnamese_line_excluded": True,
             "ocr_text_line_count": 1,
             "ocr_caption_stabilizer": True,
