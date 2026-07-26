@@ -25,7 +25,7 @@ from fastapi import File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
 
-VERSION = "NAMI_V147T_RESTORE_NATURAL_DUBBING_HELPERS"
+VERSION = "NAMI_V147U_REJECT_TRANSLATION_SERVER_ERRORS"
 MAX_UPLOAD_BYTES = 120 * 1024 * 1024
 
 _PROCESS_LOCK = Lock()
@@ -445,7 +445,88 @@ def _translation_is_valid(
     if value == source.strip():
         return False
 
-    if value == "[Không dịch được câu này]":
+    lowered = value.lower()
+
+    rejected_fragments = (
+        "[không dịch được",
+        "error 500",
+        "error 502",
+        "error 503",
+        "error 504",
+        "server error",
+        "service unavailable",
+        "internal server error",
+        "bad gateway",
+        "gateway timeout",
+        "please try again",
+        "try again later",
+        "temporarily unavailable",
+        "too many requests",
+        "access denied",
+        "captcha",
+        "<html",
+        "<!doctype",
+        "<body",
+        "</html>",
+        "cloudflare",
+        "nginx",
+    )
+
+    if any(
+        fragment in lowered
+        for fragment in rejected_fragments
+    ):
+        return False
+
+    if lowered.startswith(
+        ("http://", "https://")
+    ):
+        return False
+
+    # Phản hồi lỗi máy chủ thường dài và gần như
+    # hoàn toàn là tiếng Anh, không phải câu Việt.
+    latin_letters = sum(
+        char.isascii() and char.isalpha()
+        for char in value
+    )
+
+    vietnamese_marks = sum(
+        char in (
+            "ăâđêôơư"
+            "áàảãạ"
+            "ắằẳẵặ"
+            "ấầẩẫậ"
+            "éèẻẽẹ"
+            "ếềểễệ"
+            "íìỉĩị"
+            "óòỏõọ"
+            "ốồổỗộ"
+            "ớờởỡợ"
+            "úùủũụ"
+            "ứừửữự"
+            "ýỳỷỹỵ"
+            "ĂÂĐÊÔƠƯ"
+            "ÁÀẢÃẠ"
+            "ẮẰẲẴẶ"
+            "ẤẦẨẪẬ"
+            "ÉÈẺẼẸ"
+            "ẾỀỂỄỆ"
+            "ÍÌỈĨỊ"
+            "ÓÒỎÕỌ"
+            "ỐỒỔỖỘ"
+            "ỚỜỞỠỢ"
+            "ÚÙỦŨỤ"
+            "ỨỪỬỮỰ"
+            "ÝỲỶỸỴ"
+        )
+        for char in value
+    )
+
+    if (
+        len(value) > 45
+        and latin_letters > 35
+        and vietnamese_marks == 0
+    ):
         return False
 
     return True
@@ -1743,6 +1824,10 @@ def register_autocap_routes(app) -> None:
             "translation_placeholder_allowed": False,
             "natural_dubbing_helpers_restored": True,
             "missing_helper_runtime_guard": True,
+            "reject_translation_server_errors": True,
+            "reject_translation_html": True,
+            "reject_translation_error_codes": [500, 502, 503, 504],
+            "server_error_text_rendering_allowed": False,
             "voices": {
                 "female": "vi-VN-HoaiMyNeural",
                 "male": "vi-VN-NamMinhNeural",
