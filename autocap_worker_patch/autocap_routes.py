@@ -24,7 +24,7 @@ from fastapi import File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
 
-VERSION = "NAMI_V147Q_CHUNKED_VIETNAMESE_DUBBING"
+VERSION = "NAMI_V147R_NATURAL_PACED_VIETNAMESE_DUBBING"
 MAX_UPLOAD_BYTES = 120 * 1024 * 1024
 
 _PROCESS_LOCK = Lock()
@@ -462,6 +462,179 @@ def _translate_batch(texts: list[str]) -> list[str]:
     return results
 
 
+MAX_DUB_SPEED = 1.35
+MIN_DUB_TURN_SECONDS = 1.25
+DUB_GAP_SECONDS = 0.10
+
+
+def _compact_vietnamese_dub_text(
+    value: str,
+) -> str:
+    text = " ".join(
+        str(value or "").split()
+    ).strip()
+
+    replacements = [
+        (
+            "Dường như có một thây ma đang",
+            "Hình như zombie đang",
+        ),
+        (
+            "Có vẻ như có một thây ma đang",
+            "Hình như zombie đang",
+        ),
+        (
+            "một thây ma",
+            "zombie",
+        ),
+        (
+            "Cánh cửa này không chắc chắn",
+            "Cửa không chắc đâu",
+        ),
+        (
+            "Cánh cửa không chắc chắn",
+            "Cửa không chắc đâu",
+        ),
+        (
+            "Sao bạn dám đi bộ ở hành lang "
+            "vào đêm khuya thế này?",
+            "Muộn vậy còn dám đi ngoài hành lang?",
+        ),
+        (
+            "Bây giờ chúng tôi dự định tập hợp "
+            "tất cả những người sống sót vào "
+            "đơn vị của chúng tôi",
+            "Giờ tập hợp mọi người sống sót "
+            "trong khu",
+        ),
+        (
+            "Không có tiếng ồn lớn sẽ được "
+            "thực hiện trong toàn bộ quá trình",
+            "Chúng tôi sẽ không gây tiếng động lớn",
+        ),
+        (
+            "Chúng tôi chỉ cần đăng ký số lượng "
+            "người và dự trữ thực phẩm",
+            "Chỉ cần ghi số người và lương thực",
+        ),
+        (
+            "Không thể loại trừ khả năng bị "
+            "cướp vật tư",
+            "Có thể họ sẽ cướp vật tư",
+        ),
+        (
+            "Họ không sợ thu hút zombie sao?",
+            "Họ không sợ dụ zombie tới sao?",
+        ),
+    ]
+
+    for old, new in replacements:
+        text = text.replace(old, new)
+
+    text = text.replace(
+        "Dường như ",
+        "Hình như ",
+    )
+
+    text = text.replace(
+        "Sẽ thu hút nhiều zombie hơn",
+        "Sẽ dụ thêm nhiều zombie",
+    )
+
+    return text.strip()
+
+
+def _prepare_natural_dubbing_items(
+    items: list[dict],
+) -> list[dict]:
+    prepared: list[dict] = []
+
+    for index, original in enumerate(items):
+        item = dict(original)
+
+        start = float(
+            item.get("start", 0.0)
+        )
+
+        original_end = float(
+            item.get("end", start + 0.8)
+        )
+
+        vietnamese = _compact_vietnamese_dub_text(
+            item.get("vietnamese", "")
+        )
+
+        if not vietnamese:
+            continue
+
+        if index + 1 < len(items):
+            next_start = float(
+                items[index + 1].get(
+                    "start",
+                    original_end + 2.0,
+                )
+            )
+
+            latest_end = max(
+                start + 0.25,
+                next_start - DUB_GAP_SECONDS,
+            )
+        else:
+            latest_end = max(
+                original_end,
+                start + 4.8,
+            )
+
+        word_count = max(
+            1,
+            len(vietnamese.split()),
+        )
+
+        # Khoảng 3,1 từ/giây ở tốc độ tự nhiên.
+        desired_duration = max(
+            MIN_DUB_TURN_SECONDS,
+            word_count / 3.1,
+        )
+
+        desired_duration = min(
+            4.8,
+            desired_duration,
+        )
+
+        proposed_end = max(
+            original_end,
+            start + desired_duration,
+        )
+
+        end = min(
+            proposed_end,
+            latest_end,
+        )
+
+        # Khi khoảng trống cho phép, luôn tránh
+        # những lượt thoại chỉ dài 0,8 giây.
+        if (
+            end - start < MIN_DUB_TURN_SECONDS
+            and latest_end - start
+            >= MIN_DUB_TURN_SECONDS
+        ):
+            end = (
+                start
+                + MIN_DUB_TURN_SECONDS
+            )
+
+        item["start"] = start
+        item["end"] = max(
+            start + 0.25,
+            end,
+        )
+        item["vietnamese"] = vietnamese
+
+        prepared.append(item)
+
+    return prepared
+
+
 async def _create_voice(
     text: str,
     output_path: Path,
@@ -664,19 +837,30 @@ def _render_voice_batch_track(
             float(target_duration_ms) / 1000.0,
         )
 
-        speed = max(
+        requested_speed = max(
             1.0,
             source_duration / target_duration,
         )
 
+        # Không ép giọng nhanh quá mức nghe được.
+        speed = min(
+            MAX_DUB_SPEED,
+            requested_speed,
+        )
+
         tempo_filter = _atempo_chain(speed)
+
+        rendered_duration = min(
+            target_duration,
+            source_duration / speed,
+        )
         label = f"voice{index}"
 
         filters.append(
             f"[{index}:a]"
             f"aresample=44100,"
             f"{tempo_filter},"
-            f"atrim=0:{target_duration:.6f},"
+            f"atrim=0:{rendered_duration:.6f},"
             f"asetpts=PTS-STARTPTS,"
             f"adelay={delay_ms}|{delay_ms},"
             f"volume=1.35"
@@ -1407,6 +1591,11 @@ def register_autocap_routes(app) -> None:
             "tts_concurrency": 4,
             "tts_retry_count": 3,
             "original_audio_volume": 0.14,
+            "maximum_dubbing_speed": 1.35,
+            "minimum_dubbing_turn_seconds": 1.25,
+            "dubbing_gap_seconds": 0.10,
+            "natural_vietnamese_compaction": True,
+            "voice_tail_cut_prevention": True,
             "voices": {
                 "female": "vi-VN-HoaiMyNeural",
                 "male": "vi-VN-NamMinhNeural",
@@ -1902,6 +2091,16 @@ def register_autocap_routes(app) -> None:
                         })
 
                 items = compact_items
+
+                # V147R: trước khi tạo phụ đề và giọng,
+                # nới lượt thoại vào khoảng trống,
+                # rút gọn câu dài và giới hạn tốc độ.
+                if mode == "dub":
+                    items = (
+                        _prepare_natural_dubbing_items(
+                            items
+                        )
+                    )
 
                 subtitle_blocks = []
 
