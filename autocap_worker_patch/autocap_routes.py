@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import cv2
 import pytesseract
 
@@ -24,7 +25,7 @@ from fastapi import File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
 
-VERSION = "NAMI_V147R_NATURAL_PACED_VIETNAMESE_DUBBING"
+VERSION = "NAMI_V147S_RELIABLE_TRANSLATION_RETRY"
 MAX_UPLOAD_BYTES = 120 * 1024 * 1024
 
 _PROCESS_LOCK = Lock()
@@ -430,209 +431,180 @@ def _atempo_chain(speed: float) -> str:
         for factor in factors
     )
 
-def _translate_batch(texts: list[str]) -> list[str]:
-    translator = GoogleTranslator(
-        source="zh-CN",
-        target="vi",
-    )
-
-    try:
-        translated = translator.translate_batch(texts)
-
-        if (
-            isinstance(translated, list)
-            and len(translated) == len(texts)
-        ):
-            return [
-                str(value or "").strip()
-                for value in translated
-            ]
-    except Exception:
-        pass
-
-    results: list[str] = []
-
-    for text in texts:
-        try:
-            value = translator.translate(text)
-            results.append(str(value or "").strip())
-        except Exception:
-            results.append("")
-
-    return results
-
-
-MAX_DUB_SPEED = 1.35
-MIN_DUB_TURN_SECONDS = 1.25
-DUB_GAP_SECONDS = 0.10
-
-
-def _compact_vietnamese_dub_text(
-    value: str,
-) -> str:
-    text = " ".join(
-        str(value or "").split()
+def _translation_is_valid(
+    source: str,
+    translated: str,
+) -> bool:
+    value = " ".join(
+        str(translated or "").split()
     ).strip()
 
-    replacements = [
-        (
-            "Dường như có một thây ma đang",
-            "Hình như zombie đang",
-        ),
-        (
-            "Có vẻ như có một thây ma đang",
-            "Hình như zombie đang",
-        ),
-        (
-            "một thây ma",
-            "zombie",
-        ),
-        (
-            "Cánh cửa này không chắc chắn",
-            "Cửa không chắc đâu",
-        ),
-        (
-            "Cánh cửa không chắc chắn",
-            "Cửa không chắc đâu",
-        ),
-        (
-            "Sao bạn dám đi bộ ở hành lang "
-            "vào đêm khuya thế này?",
-            "Muộn vậy còn dám đi ngoài hành lang?",
-        ),
-        (
-            "Bây giờ chúng tôi dự định tập hợp "
-            "tất cả những người sống sót vào "
-            "đơn vị của chúng tôi",
-            "Giờ tập hợp mọi người sống sót "
-            "trong khu",
-        ),
-        (
-            "Không có tiếng ồn lớn sẽ được "
-            "thực hiện trong toàn bộ quá trình",
-            "Chúng tôi sẽ không gây tiếng động lớn",
-        ),
-        (
-            "Chúng tôi chỉ cần đăng ký số lượng "
-            "người và dự trữ thực phẩm",
-            "Chỉ cần ghi số người và lương thực",
-        ),
-        (
-            "Không thể loại trừ khả năng bị "
-            "cướp vật tư",
-            "Có thể họ sẽ cướp vật tư",
-        ),
-        (
-            "Họ không sợ thu hút zombie sao?",
-            "Họ không sợ dụ zombie tới sao?",
-        ),
+    if not value:
+        return False
+
+    if value == source.strip():
+        return False
+
+    if value == "[Không dịch được câu này]":
+        return False
+
+    return True
+
+
+def _translate_batch(
+    texts: list[str],
+) -> list[str]:
+    sources = [
+        " ".join(str(value or "").split()).strip()
+        for value in texts
     ]
 
-    for old, new in replacements:
-        text = text.replace(old, new)
+    results = ["" for _ in sources]
+    batch_size = 10
 
-    text = text.replace(
-        "Dường như ",
-        "Hình như ",
-    )
+    # Dịch theo cụm nhỏ để tránh một lỗi mạng
+    # làm trống toàn bộ 72 câu.
+    for batch_start in range(
+        0,
+        len(sources),
+        batch_size,
+    ):
+        indexes = list(range(
+            batch_start,
+            min(
+                len(sources),
+                batch_start + batch_size,
+            ),
+        ))
 
-    text = text.replace(
-        "Sẽ thu hút nhiều zombie hơn",
-        "Sẽ dụ thêm nhiều zombie",
-    )
+        pending = [
+            index
+            for index in indexes
+            if sources[index]
+        ]
 
-    return text.strip()
+        for attempt in range(4):
+            if not pending:
+                break
 
+            source_language = (
+                "zh-CN"
+                if attempt < 2
+                else "auto"
+            )
 
-def _prepare_natural_dubbing_items(
-    items: list[dict],
-) -> list[dict]:
-    prepared: list[dict] = []
+            translator = GoogleTranslator(
+                source=source_language,
+                target="vi",
+            )
 
-    for index, original in enumerate(items):
-        item = dict(original)
+            batch_texts = [
+                sources[index]
+                for index in pending
+            ]
 
-        start = float(
-            item.get("start", 0.0)
-        )
+            translated_values = None
 
-        original_end = float(
-            item.get("end", start + 0.8)
-        )
-
-        vietnamese = _compact_vietnamese_dub_text(
-            item.get("vietnamese", "")
-        )
-
-        if not vietnamese:
-            continue
-
-        if index + 1 < len(items):
-            next_start = float(
-                items[index + 1].get(
-                    "start",
-                    original_end + 2.0,
+            try:
+                translated_values = (
+                    translator.translate_batch(
+                        batch_texts
+                    )
                 )
-            )
+            except Exception:
+                translated_values = None
 
-            latest_end = max(
-                start + 0.25,
-                next_start - DUB_GAP_SECONDS,
-            )
-        else:
-            latest_end = max(
-                original_end,
-                start + 4.8,
-            )
+            next_pending = []
 
-        word_count = max(
-            1,
-            len(vietnamese.split()),
+            if (
+                isinstance(translated_values, list)
+                and len(translated_values)
+                == len(pending)
+            ):
+                for index, translated in zip(
+                    pending,
+                    translated_values,
+                ):
+                    value = " ".join(
+                        str(translated or "").split()
+                    ).strip()
+
+                    if _translation_is_valid(
+                        sources[index],
+                        value,
+                    ):
+                        results[index] = value
+                    else:
+                        next_pending.append(index)
+            else:
+                next_pending = list(pending)
+
+            pending = next_pending
+
+            if pending:
+                time.sleep(
+                    1.0 + attempt * 1.5
+                )
+
+        # Những câu cụm vẫn lỗi được dịch riêng
+        # từng câu, tạo translator mới mỗi lượt.
+        for index in list(pending):
+            for attempt in range(5):
+                source_language = (
+                    "zh-CN"
+                    if attempt < 3
+                    else "auto"
+                )
+
+                try:
+                    translator = GoogleTranslator(
+                        source=source_language,
+                        target="vi",
+                    )
+
+                    value = translator.translate(
+                        sources[index]
+                    )
+
+                    value = " ".join(
+                        str(value or "").split()
+                    ).strip()
+                except Exception:
+                    value = ""
+
+                if _translation_is_valid(
+                    sources[index],
+                    value,
+                ):
+                    results[index] = value
+                    break
+
+                time.sleep(
+                    1.0 + attempt
+                )
+
+    failed_indexes = [
+        index
+        for index, value in enumerate(results)
+        if sources[index]
+        and not _translation_is_valid(
+            sources[index],
+            value,
+        )
+    ]
+
+    if failed_indexes:
+        failed_sources = [
+            sources[index]
+            for index in failed_indexes[:5]
+        ]
+
+        raise RuntimeError(
+            "TRANSLATION_INCOMPLETE_AFTER_RETRIES: "
+            + " | ".join(failed_sources)
         )
 
-        # Khoảng 3,1 từ/giây ở tốc độ tự nhiên.
-        desired_duration = max(
-            MIN_DUB_TURN_SECONDS,
-            word_count / 3.1,
-        )
-
-        desired_duration = min(
-            4.8,
-            desired_duration,
-        )
-
-        proposed_end = max(
-            original_end,
-            start + desired_duration,
-        )
-
-        end = min(
-            proposed_end,
-            latest_end,
-        )
-
-        # Khi khoảng trống cho phép, luôn tránh
-        # những lượt thoại chỉ dài 0,8 giây.
-        if (
-            end - start < MIN_DUB_TURN_SECONDS
-            and latest_end - start
-            >= MIN_DUB_TURN_SECONDS
-        ):
-            end = (
-                start
-                + MIN_DUB_TURN_SECONDS
-            )
-
-        item["start"] = start
-        item["end"] = max(
-            start + 0.25,
-            end,
-        )
-        item["vietnamese"] = vietnamese
-
-        prepared.append(item)
-
-    return prepared
+    return results
 
 
 async def _create_voice(
@@ -1596,6 +1568,11 @@ def register_autocap_routes(app) -> None:
             "dubbing_gap_seconds": 0.10,
             "natural_vietnamese_compaction": True,
             "voice_tail_cut_prevention": True,
+            "translation_batch_size": 10,
+            "translation_batch_retry_count": 4,
+            "translation_sentence_retry_count": 5,
+            "translation_auto_fallback": True,
+            "translation_placeholder_allowed": False,
             "voices": {
                 "female": "vi-VN-HoaiMyNeural",
                 "male": "vi-VN-NamMinhNeural",
@@ -2023,8 +2000,11 @@ def register_autocap_routes(app) -> None:
                     ).strip()
 
                     if not vietnamese:
-                        vietnamese = (
-                            "[Không dịch được câu này]"
+                        raise RuntimeError(
+                            "EMPTY_TRANSLATION_FOR_SOURCE: "
+                            + str(
+                                item.get("source", "")
+                            )
                         )
 
                     words = vietnamese.split()
