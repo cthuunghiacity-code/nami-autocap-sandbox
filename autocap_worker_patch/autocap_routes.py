@@ -8,6 +8,11 @@ import subprocess
 import tempfile
 import cv2
 import pytesseract
+
+try:
+    from rapidocr_onnxruntime import RapidOCR
+except Exception:
+    RapidOCR = None
 from difflib import SequenceMatcher
 from pytesseract import Output
 from pathlib import Path
@@ -19,7 +24,7 @@ from fastapi import File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
 
-VERSION = "NAMI_V147N_EXACT_BOTTOM_CHINESE_LINE_OCR"
+VERSION = "NAMI_V147O_RAPIDOCR_CHINESE_CAPTIONS"
 MAX_UPLOAD_BYTES = 120 * 1024 * 1024
 
 _PROCESS_LOCK = Lock()
@@ -735,6 +740,105 @@ def _text_similarity(left: str, right: str) -> float:
     ).ratio()
 
 
+_RAPID_OCR_ENGINE = None
+
+
+def _get_rapid_ocr():
+    global _RAPID_OCR_ENGINE
+
+    if _RAPID_OCR_ENGINE is not None:
+        return _RAPID_OCR_ENGINE
+
+    if RapidOCR is None:
+        return None
+
+    try:
+        _RAPID_OCR_ENGINE = RapidOCR()
+    except Exception:
+        _RAPID_OCR_ENGINE = None
+
+    return _RAPID_OCR_ENGINE
+
+
+def _rapid_ocr_candidate(image) -> str:
+    engine = _get_rapid_ocr()
+
+    if engine is None:
+        return ""
+
+    try:
+        result, _ = engine(image)
+    except Exception:
+        return ""
+
+    if not result:
+        return ""
+
+    candidates = []
+
+    for entry in result:
+        if not entry or len(entry) < 3:
+            continue
+
+        raw_text = _normalise_ocr_text(
+            str(entry[1] or "")
+        )
+
+        try:
+            confidence = float(entry[2])
+        except Exception:
+            confidence = 0.0
+
+        cjk = _cjk_count(raw_text)
+
+        if cjk < 2:
+            continue
+
+        if confidence < 0.30:
+            continue
+
+        if not _is_valid_caption_text(raw_text):
+            continue
+
+        candidates.append({
+            "text": raw_text,
+            "confidence": confidence,
+            "cjk": cjk,
+        })
+
+    if not candidates:
+        return ""
+
+    candidates.sort(
+        key=lambda item: (
+            item["confidence"],
+            item["cjk"],
+            len(item["text"]),
+        ),
+        reverse=True,
+    )
+
+    return candidates[0]["text"]
+
+
+def _tesseract_fallback_candidate(image) -> str:
+    try:
+        raw = pytesseract.image_to_string(
+            image,
+            lang="chi_sim",
+            config="--psm 7",
+        )
+    except Exception:
+        return ""
+
+    candidate = _normalise_ocr_text(raw)
+
+    if not _is_valid_caption_text(candidate):
+        return ""
+
+    return candidate
+
+
 def _ocr_one_frame(frame_path: Path) -> str:
     image = cv2.imread(str(frame_path))
 
@@ -743,122 +847,96 @@ def _ocr_one_frame(frame_path: Path) -> str:
 
     height, width = image.shape[:2]
 
-    # Tự thử nhiều dải vì mỗi nguồn video đặt phụ đề khác nhau.
-    # Khung 1280x720 đã kiểm tra:
-    # tiếng Việt nằm phía trên; chữ Trung chỉ ở sát đáy.
-    # Chỉ giữ đúng dòng Trung, không đưa dòng Việt vào OCR.
-    candidate_bands = [
-        (0.915, 0.999),
+    # Video đã xác định:
+    # chữ Trung nằm ở dòng sát đáy.
+    top = max(0, int(height * 0.915))
+    bottom = min(height, int(height * 0.999))
+    left = max(0, int(width * 0.02))
+    right = min(width, int(width * 0.98))
+
+    crop = image[top:bottom, left:right]
+
+    if crop.size == 0:
+        return ""
+
+    enlarged = cv2.resize(
+        crop,
+        None,
+        fx=4.0,
+        fy=4.0,
+        interpolation=cv2.INTER_CUBIC,
+    )
+
+    # Tăng nét chữ trắng có viền đen.
+    blurred = cv2.GaussianBlur(
+        enlarged,
+        (0, 0),
+        1.2,
+    )
+
+    sharpened = cv2.addWeighted(
+        enlarged,
+        1.8,
+        blurred,
+        -0.8,
+        0,
+    )
+
+    rapid_candidates = [
+        _rapid_ocr_candidate(enlarged),
+        _rapid_ocr_candidate(sharpened),
     ]
 
-    best_text = ""
-    best_score = -1.0
+    rapid_candidates = [
+        value
+        for value in rapid_candidates
+        if _is_valid_caption_text(value)
+    ]
 
-    for top_ratio, bottom_ratio in candidate_bands:
-        top = max(0, int(height * top_ratio))
-        bottom = min(height, int(height * bottom_ratio))
-        left = max(0, int(width * 0.04))
-        right = min(width, int(width * 0.96))
-
-        crop = image[top:bottom, left:right]
-
-        if crop.size == 0:
-            continue
-
-        gray = cv2.cvtColor(
-            crop,
-            cv2.COLOR_BGR2GRAY,
+    if rapid_candidates:
+        return max(
+            rapid_candidates,
+            key=lambda value: (
+                _cjk_count(value),
+                len(value),
+            ),
         )
 
-        gray = cv2.resize(
-            gray,
-            None,
-            fx=3.0,
-            fy=3.0,
-            interpolation=cv2.INTER_CUBIC,
-        )
+    # Chỉ dùng Tesseract khi RapidOCR không cho kết quả.
+    gray = cv2.cvtColor(
+        sharpened,
+        cv2.COLOR_BGR2GRAY,
+    )
 
-        blurred = cv2.GaussianBlur(
-            gray,
-            (3, 3),
-            0,
-        )
+    threshold = cv2.threshold(
+        gray,
+        0,
+        255,
+        cv2.THRESH_BINARY
+        + cv2.THRESH_OTSU,
+    )[1]
 
-        variants = [
-            gray,
-            cv2.threshold(
-                blurred,
-                0,
-                255,
-                cv2.THRESH_BINARY
-                + cv2.THRESH_OTSU,
-            )[1],
-        ]
+    fallback_candidates = [
+        _tesseract_fallback_candidate(gray),
+        _tesseract_fallback_candidate(threshold),
+    ]
 
-        for variant in variants:
-            for psm in (7,):
-                try:
-                    data = pytesseract.image_to_data(
-                        variant,
-                        lang="chi_sim",
-                        config=f"--psm {psm}",
-                        output_type=Output.DICT,
-                    )
-                except Exception:
-                    continue
+    fallback_candidates = [
+        value
+        for value in fallback_candidates
+        if _is_valid_caption_text(value)
+    ]
 
-                words = []
-                confidence_total = 0.0
+    if not fallback_candidates:
+        return ""
 
-                for index, raw in enumerate(
-                    data.get("text", [])
-                ):
-                    word = _normalise_ocr_text(
-                        str(raw or "")
-                    )
-
-                    try:
-                        confidence = float(
-                            data["conf"][index]
-                        )
-                    except Exception:
-                        confidence = -1.0
-
-                    if (
-                        confidence >= 10
-                        and _cjk_count(word) >= 1
-                    ):
-                        words.append(word)
-                        confidence_total += max(
-                            confidence,
-                            0.0,
-                        )
-
-                candidate = _normalise_ocr_text(
-                    "".join(words)
-                )
-
-                cjk = _cjk_count(candidate)
-
-                if cjk < 2:
-                    continue
-
-                if not _is_valid_caption_text(
-                    candidate
-                ):
-                    continue
-
-                score = (
-                    confidence_total
-                    + cjk * 20
-                    + min(len(candidate), 45) * 2
-                )
-
-                if score > best_score:
-                    best_score = score
-                    best_text = candidate
-
-    return best_text
+    return max(
+        fallback_candidates,
+        key=lambda value: (
+            _cjk_count(value),
+            len(value),
+        ),
+    )
 
 
 def _extract_ocr_items(
@@ -1064,12 +1142,15 @@ def register_autocap_routes(app) -> None:
             "recognition_primary": "chinese_caption_ocr",
             "recognition_fallback": "whisper",
             "diagnostic_endpoint": "/autocap/diagnose",
-            "ocr_band_mode": "exact_bottom_chinese_line",
+            "ocr_band_mode": "rapidocr_exact_bottom_line",
             "ocr_sampling_fps": 1,
             "ocr_candidate_bands": 1,
             "ocr_vertical_range": "91.5%-99.9%",
             "ocr_horizontal_range": "4%-96%",
             "ocr_language": "chi_sim",
+            "ocr_engine_primary": "rapidocr_onnxruntime",
+            "ocr_engine_fallback": "tesseract_chi_sim",
+            "ocr_upscale_factor": 4.0,
             "vietnamese_line_excluded": True,
             "ocr_text_line_count": 1,
             "ocr_caption_stabilizer": True,
