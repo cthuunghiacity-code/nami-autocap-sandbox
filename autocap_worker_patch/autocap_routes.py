@@ -25,7 +25,7 @@ from fastapi import File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
 
-VERSION = "NAMI_V147S_RELIABLE_TRANSLATION_RETRY"
+VERSION = "NAMI_V147T_RESTORE_NATURAL_DUBBING_HELPERS"
 MAX_UPLOAD_BYTES = 120 * 1024 * 1024
 
 _PROCESS_LOCK = Lock()
@@ -605,6 +605,174 @@ def _translate_batch(
         )
 
     return results
+
+
+MAX_DUB_SPEED = 1.35
+MIN_DUB_TURN_SECONDS = 1.25
+DUB_GAP_SECONDS = 0.10
+
+
+def _compact_vietnamese_dub_text(
+    value: str,
+) -> str:
+    text = " ".join(
+        str(value or "").split()
+    ).strip()
+
+    replacements = [
+        (
+            "Dường như có một thây ma đang",
+            "Hình như zombie đang",
+        ),
+        (
+            "Có vẻ như có một thây ma đang",
+            "Hình như zombie đang",
+        ),
+        (
+            "một thây ma",
+            "zombie",
+        ),
+        (
+            "Cánh cửa này không chắc chắn",
+            "Cửa không chắc đâu",
+        ),
+        (
+            "Cánh cửa không chắc chắn",
+            "Cửa không chắc đâu",
+        ),
+        (
+            "Sao bạn dám đi bộ ở hành lang "
+            "vào đêm khuya thế này?",
+            "Muộn vậy còn dám đi ngoài hành lang?",
+        ),
+        (
+            "Bây giờ chúng tôi dự định tập hợp "
+            "tất cả những người sống sót vào "
+            "đơn vị của chúng tôi",
+            "Giờ tập hợp mọi người sống sót trong khu",
+        ),
+        (
+            "Không có tiếng ồn lớn sẽ được "
+            "thực hiện trong toàn bộ quá trình",
+            "Chúng tôi sẽ không gây tiếng động lớn",
+        ),
+        (
+            "Chúng tôi chỉ cần đăng ký số lượng "
+            "người và dự trữ thực phẩm",
+            "Chỉ cần ghi số người và lương thực",
+        ),
+        (
+            "Không thể loại trừ khả năng bị cướp vật tư",
+            "Có thể họ sẽ cướp vật tư",
+        ),
+        (
+            "Họ không sợ thu hút zombie sao?",
+            "Họ không sợ dụ zombie tới sao?",
+        ),
+    ]
+
+    for old, new in replacements:
+        text = text.replace(old, new)
+
+    text = text.replace(
+        "Dường như ",
+        "Hình như ",
+    )
+
+    text = text.replace(
+        "Sẽ thu hút nhiều zombie hơn",
+        "Sẽ dụ thêm nhiều zombie",
+    )
+
+    return text.strip()
+
+
+def _prepare_natural_dubbing_items(
+    items: list[dict],
+) -> list[dict]:
+    prepared: list[dict] = []
+
+    for index, original in enumerate(items):
+        item = dict(original)
+
+        start = float(
+            item.get("start", 0.0)
+        )
+
+        original_end = float(
+            item.get("end", start + 0.8)
+        )
+
+        vietnamese = _compact_vietnamese_dub_text(
+            item.get("vietnamese", "")
+        )
+
+        if not vietnamese:
+            continue
+
+        if index + 1 < len(items):
+            next_start = float(
+                items[index + 1].get(
+                    "start",
+                    original_end + 2.0,
+                )
+            )
+
+            latest_end = max(
+                start + 0.25,
+                next_start - DUB_GAP_SECONDS,
+            )
+        else:
+            latest_end = max(
+                original_end,
+                start + 4.8,
+            )
+
+        word_count = max(
+            1,
+            len(vietnamese.split()),
+        )
+
+        desired_duration = max(
+            MIN_DUB_TURN_SECONDS,
+            word_count / 3.1,
+        )
+
+        desired_duration = min(
+            4.8,
+            desired_duration,
+        )
+
+        proposed_end = max(
+            original_end,
+            start + desired_duration,
+        )
+
+        end = min(
+            proposed_end,
+            latest_end,
+        )
+
+        if (
+            end - start < MIN_DUB_TURN_SECONDS
+            and latest_end - start
+            >= MIN_DUB_TURN_SECONDS
+        ):
+            end = (
+                start
+                + MIN_DUB_TURN_SECONDS
+            )
+
+        item["start"] = start
+        item["end"] = max(
+            start + 0.25,
+            end,
+        )
+        item["vietnamese"] = vietnamese
+
+        prepared.append(item)
+
+    return prepared
 
 
 async def _create_voice(
@@ -1573,6 +1741,8 @@ def register_autocap_routes(app) -> None:
             "translation_sentence_retry_count": 5,
             "translation_auto_fallback": True,
             "translation_placeholder_allowed": False,
+            "natural_dubbing_helpers_restored": True,
+            "missing_helper_runtime_guard": True,
             "voices": {
                 "female": "vi-VN-HoaiMyNeural",
                 "male": "vi-VN-NamMinhNeural",
