@@ -25,7 +25,7 @@ from fastapi import File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
 
-VERSION = "NAMI_V147V_SLOW_NO_CUT_VIETNAMESE_DUBBING"
+VERSION = "NAMI_V147W_WHOLE_SENTENCE_SYNCHRONIZED_DUBBING"
 MAX_UPLOAD_BYTES = 120 * 1024 * 1024
 
 _PROCESS_LOCK = Lock()
@@ -772,17 +772,16 @@ def _prepare_natural_dubbing_items(
     items: list[dict],
 ) -> list[dict]:
     prepared: list[dict] = []
-    next_free_start = 0.0
 
-    for original in items:
+    for index, original in enumerate(items):
         item = dict(original)
 
-        source_start = float(
+        start = float(
             item.get("start", 0.0)
         )
 
         source_end = float(
-            item.get("end", source_start + 0.8)
+            item.get("end", start + 1.2)
         )
 
         vietnamese = _compact_vietnamese_dub_text(
@@ -792,37 +791,64 @@ def _prepare_natural_dubbing_items(
         if not vietnamese:
             continue
 
-        # Không để câu mới đè lên câu trước.
-        start = max(
-            source_start,
-            next_free_start,
-        )
-
         word_count = max(
             1,
             len(vietnamese.split()),
         )
 
-        # Tốc độ đọc tự nhiên khoảng 2,6 từ/giây.
+        # Thời lượng nói tự nhiên, nhưng câu vẫn
+        # bắt đầu đúng lúc dòng chữ Trung xuất hiện.
         estimated_duration = max(
             1.20,
-            word_count / 2.6,
+            word_count / 2.8,
         )
 
-        # Không ép câu vào đúng khung OCR ngắn.
-        end = max(
-            source_end,
-            start + estimated_duration,
+        # Không cho một câu kéo dài vô hạn.
+        estimated_duration = min(
+            5.2,
+            estimated_duration,
         )
+
+        if index + 1 < len(items):
+            next_start = float(
+                items[index + 1].get(
+                    "start",
+                    source_end + 2.0,
+                )
+            )
+
+            available = max(
+                0.35,
+                next_start - start - 0.05,
+            )
+
+            # Khi đủ khoảng trống thì dùng trọn thời
+            # lượng tự nhiên. Khi thiếu, bộ chỉnh tốc
+            # chỉ tăng nhẹ tối đa 1.10 lần.
+            desired_duration = max(
+                source_end - start,
+                min(
+                    estimated_duration,
+                    max(
+                        available,
+                        source_end - start,
+                    ),
+                ),
+            )
+        else:
+            desired_duration = max(
+                source_end - start,
+                estimated_duration,
+            )
 
         item["start"] = start
-        item["end"] = end
+        item["end"] = (
+            start
+            + max(0.35, desired_duration)
+        )
         item["vietnamese"] = vietnamese
 
         prepared.append(item)
-
-        # Chừa nhịp nghỉ nhỏ giữa hai câu.
-        next_free_start = end + 0.12
 
     return prepared
 
@@ -1805,6 +1831,11 @@ def register_autocap_routes(app) -> None:
             "sequential_voice_scheduling": True,
             "allow_voice_overrun": True,
             "minimum_voice_gap_seconds": 0.12,
+            "one_chinese_caption_one_vietnamese_voice": True,
+            "translation_chunk_splitting": False,
+            "voice_fragment_splitting": False,
+            "voice_start_locked_to_caption": True,
+            "cumulative_voice_delay_prevention": True,
             "voices": {
                 "female": "vi-VN-HoaiMyNeural",
                 "male": "vi-VN-NamMinhNeural",
@@ -2239,68 +2270,29 @@ def register_autocap_routes(app) -> None:
                             )
                         )
 
-                    words = vietnamese.split()
-                    chunks = []
-                    current = ""
-
-                    for word in words:
-                        candidate = (
-                            word
-                            if not current
-                            else current + " " + word
-                        )
-
-                        if len(candidate) <= 58:
-                            current = candidate
-                        else:
-                            if current:
-                                chunks.append(current)
-                            current = word
-
-                    if current:
-                        chunks.append(current)
-
-                    if not chunks:
-                        continue
-
-                    original_start = float(item["start"])
-                    original_end = float(item["end"])
-                    original_duration = max(
-                        1.2,
-                        original_end - original_start,
-                    )
-
-                    chunk_duration = max(
-                        1.2,
-                        min(
-                            4.5,
-                            original_duration
-                            / len(chunks),
+                    # V147W:
+                    # Một dòng phụ đề Trung tương ứng đúng
+                    # một câu Việt hoàn chỉnh.
+                    # Không chia câu Việt thành nhiều mẩu
+                    # và không tạo nhiều file giọng cho
+                    # cùng một câu Trung.
+                    compact_items.append({
+                        "start": float(
+                            item.get("start", 0.0)
                         ),
-                    )
-
-                    for chunk_index, chunk in enumerate(
-                        chunks
-                    ):
-                        chunk_start = (
-                            original_start
-                            + chunk_index * chunk_duration
-                        )
-
-                        chunk_end = min(
-                            original_end,
-                            chunk_start + chunk_duration,
-                        )
-
-                        if chunk_end <= chunk_start:
-                            chunk_end = chunk_start + 1.2
-
-                        compact_items.append({
-                            "start": chunk_start,
-                            "end": chunk_end,
-                            "source": item["source"],
-                            "vietnamese": chunk,
-                        })
+                        "end": float(
+                            item.get(
+                                "end",
+                                float(
+                                    item.get("start", 0.0)
+                                ) + 1.2,
+                            )
+                        ),
+                        "source": str(
+                            item.get("source", "")
+                        ).strip(),
+                        "vietnamese": vietnamese,
+                    })
 
                 items = compact_items
 
