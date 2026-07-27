@@ -25,7 +25,7 @@ from fastapi import File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
 
-VERSION = "NAMI_V147U_REJECT_TRANSLATION_SERVER_ERRORS"
+VERSION = "NAMI_V147V_SLOW_NO_CUT_VIETNAMESE_DUBBING"
 MAX_UPLOAD_BYTES = 120 * 1024 * 1024
 
 _PROCESS_LOCK = Lock()
@@ -688,7 +688,7 @@ def _translate_batch(
     return results
 
 
-MAX_DUB_SPEED = 1.35
+MAX_DUB_SPEED = 1.10
 MIN_DUB_TURN_SECONDS = 1.25
 DUB_GAP_SECONDS = 0.10
 
@@ -772,16 +772,17 @@ def _prepare_natural_dubbing_items(
     items: list[dict],
 ) -> list[dict]:
     prepared: list[dict] = []
+    next_free_start = 0.0
 
-    for index, original in enumerate(items):
+    for original in items:
         item = dict(original)
 
-        start = float(
+        source_start = float(
             item.get("start", 0.0)
         )
 
-        original_end = float(
-            item.get("end", start + 0.8)
+        source_end = float(
+            item.get("end", source_start + 0.8)
         )
 
         vietnamese = _compact_vietnamese_dub_text(
@@ -791,67 +792,37 @@ def _prepare_natural_dubbing_items(
         if not vietnamese:
             continue
 
-        if index + 1 < len(items):
-            next_start = float(
-                items[index + 1].get(
-                    "start",
-                    original_end + 2.0,
-                )
-            )
-
-            latest_end = max(
-                start + 0.25,
-                next_start - DUB_GAP_SECONDS,
-            )
-        else:
-            latest_end = max(
-                original_end,
-                start + 4.8,
-            )
+        # Không để câu mới đè lên câu trước.
+        start = max(
+            source_start,
+            next_free_start,
+        )
 
         word_count = max(
             1,
             len(vietnamese.split()),
         )
 
-        desired_duration = max(
-            MIN_DUB_TURN_SECONDS,
-            word_count / 3.1,
+        # Tốc độ đọc tự nhiên khoảng 2,6 từ/giây.
+        estimated_duration = max(
+            1.20,
+            word_count / 2.6,
         )
 
-        desired_duration = min(
-            4.8,
-            desired_duration,
+        # Không ép câu vào đúng khung OCR ngắn.
+        end = max(
+            source_end,
+            start + estimated_duration,
         )
-
-        proposed_end = max(
-            original_end,
-            start + desired_duration,
-        )
-
-        end = min(
-            proposed_end,
-            latest_end,
-        )
-
-        if (
-            end - start < MIN_DUB_TURN_SECONDS
-            and latest_end - start
-            >= MIN_DUB_TURN_SECONDS
-        ):
-            end = (
-                start
-                + MIN_DUB_TURN_SECONDS
-            )
 
         item["start"] = start
-        item["end"] = max(
-            start + 0.25,
-            end,
-        )
+        item["end"] = end
         item["vietnamese"] = vietnamese
 
         prepared.append(item)
+
+        # Chừa nhịp nghỉ nhỏ giữa hai câu.
+        next_free_start = end + 0.12
 
     return prepared
 
@@ -1071,9 +1042,10 @@ def _render_voice_batch_track(
 
         tempo_filter = _atempo_chain(speed)
 
-        rendered_duration = min(
-            target_duration,
-            source_duration / speed,
+        # V147V: tuyệt đối không cắt đuôi câu.
+        # Giữ toàn bộ thời lượng sau khi chỉnh tốc độ.
+        rendered_duration = (
+            source_duration / speed
         )
         label = f"voice{index}"
 
@@ -1081,7 +1053,7 @@ def _render_voice_batch_track(
             f"[{index}:a]"
             f"aresample=44100,"
             f"{tempo_filter},"
-            f"atrim=0:{rendered_duration:.6f},"
+            f"apad=pad_dur=0.05,"
             f"asetpts=PTS-STARTPTS,"
             f"adelay={delay_ms}|{delay_ms},"
             f"volume=1.35"
@@ -1828,6 +1800,11 @@ def register_autocap_routes(app) -> None:
             "reject_translation_html": True,
             "reject_translation_error_codes": [500, 502, 503, 504],
             "server_error_text_rendering_allowed": False,
+            "maximum_dubbing_speed": 1.10,
+            "no_voice_trimming": True,
+            "sequential_voice_scheduling": True,
+            "allow_voice_overrun": True,
+            "minimum_voice_gap_seconds": 0.12,
             "voices": {
                 "female": "vi-VN-HoaiMyNeural",
                 "male": "vi-VN-NamMinhNeural",
