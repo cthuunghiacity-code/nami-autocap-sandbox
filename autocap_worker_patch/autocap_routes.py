@@ -25,7 +25,7 @@ from fastapi import File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
 
-VERSION = "NAMI_V147W_WHOLE_SENTENCE_SYNCHRONIZED_DUBBING"
+VERSION = "NAMI_V147X_SPEECH_TURN_CAPTION_MERGE"
 MAX_UPLOAD_BYTES = 120 * 1024 * 1024
 
 _PROCESS_LOCK = Lock()
@@ -299,6 +299,55 @@ def _cross_check_translation_sources(
         for item in items
     ]
 
+def _merge_chinese_caption_parts(
+    current: str,
+    incoming: str,
+) -> str:
+    left = "".join(
+        str(current or "").split()
+    ).strip()
+
+    right = "".join(
+        str(incoming or "").split()
+    ).strip()
+
+    if not left:
+        return right
+
+    if not right:
+        return left
+
+    if left == right:
+        return left
+
+    if right in left:
+        return left
+
+    if left in right:
+        return right
+
+    # Ghép phần đuôi dòng trước trùng với
+    # phần đầu dòng sau để không lặp chữ.
+    maximum_overlap = min(
+        len(left),
+        len(right),
+        12,
+    )
+
+    for size in range(
+        maximum_overlap,
+        0,
+        -1,
+    ):
+        if left[-size:] == right[:size]:
+            return left + right[size:]
+
+    # Hai dòng khác nhau nhưng cùng lượt nói:
+    # nối bằng dấu phẩy Trung để bộ dịch hiểu
+    # đây là một câu liên tục.
+    return left.rstrip("，。！？") + "，" + right
+
+
 def _align_ocr_items_to_chinese_speech(
     items: list[dict],
     speech_windows: list[dict],
@@ -306,28 +355,51 @@ def _align_ocr_items_to_chinese_speech(
     if not items or not speech_windows:
         return items
 
-    aligned: list[dict] = []
-    previous_end = 0.0
-    search_from = 0
+    assignments: list[dict] = []
+    last_window_index = 0
 
     for item in items:
-        item_start = float(item["start"])
-        item_end = float(item["end"])
-        item_center = (item_start + item_end) / 2.0
+        item_start = float(
+            item.get("start", 0.0)
+        )
+        item_end = float(
+            item.get("end", item_start + 0.8)
+        )
+        item_center = (
+            item_start + item_end
+        ) / 2.0
 
         best_index = None
         best_score = float("-inf")
 
-        # Tìm cửa sổ giọng Trung gần và trùng thời gian nhất.
-        upper = min(
-            len(speech_windows),
-            search_from + 10,
+        # Cho phép nhiều dòng OCR cùng trỏ vào
+        # một cửa sổ giọng nói. Không còn bắt buộc
+        # mỗi dòng phải chuyển sang cửa sổ kế tiếp.
+        search_start = max(
+            0,
+            last_window_index - 2,
         )
 
-        for index in range(search_from, upper):
+        search_end = min(
+            len(speech_windows),
+            last_window_index + 14,
+        )
+
+        for index in range(
+            search_start,
+            search_end,
+        ):
             window = speech_windows[index]
-            speech_start = float(window["start"])
-            speech_end = float(window["end"])
+
+            speech_start = float(
+                window.get("start", 0.0)
+            )
+            speech_end = float(
+                window.get(
+                    "end",
+                    speech_start + 0.5,
+                )
+            )
             speech_center = (
                 speech_start + speech_end
             ) / 2.0
@@ -338,51 +410,148 @@ def _align_ocr_items_to_chinese_speech(
                 speech_start,
                 speech_end,
             )
+
             center_distance = abs(
                 item_center - speech_center
             )
 
-            score = overlap * 10.0 - center_distance
+            # Ưu tiên giao nhau thật; vẫn cho phép
+            # OCR lệch nhẹ tối đa khoảng một giây.
+            score = (
+                overlap * 12.0
+                - center_distance
+            )
+
+            if (
+                overlap <= 0
+                and center_distance > 1.25
+            ):
+                score -= 8.0
 
             if score > best_score:
                 best_score = score
                 best_index = index
 
         if best_index is None:
-            aligned.append(dict(item))
+            assignments.append({
+                "window_index": None,
+                "item": dict(item),
+            })
             continue
 
-        selected = speech_windows[best_index]
-        speech_start = float(selected["start"])
-        speech_end = float(selected["end"])
+        assignments.append({
+            "window_index": best_index,
+            "item": dict(item),
+        })
 
-        # Không cho câu sau chạy ngược lên câu trước.
-        speech_start = max(
-            speech_start,
-            previous_end,
+        last_window_index = max(
+            last_window_index,
+            best_index,
         )
-        speech_end = max(
-            speech_start + 0.25,
-            speech_end,
+
+    merged: list[dict] = []
+
+    for assignment in assignments:
+        window_index = assignment[
+            "window_index"
+        ]
+        item = assignment["item"]
+
+        if window_index is None:
+            merged.append(item)
+            continue
+
+        window = speech_windows[
+            window_index
+        ]
+
+        speech_start = float(
+            window.get("start", item["start"])
         )
+        speech_end = float(
+            window.get("end", item["end"])
+        )
+
+        source = str(
+            item.get("source", "")
+        ).strip()
+
+        # Nếu dòng hiện tại và dòng trước cùng nằm
+        # trong một cửa sổ giọng Trung, ghép thành
+        # một lượt thoại duy nhất.
+        if (
+            merged
+            and merged[-1].get(
+                "_speech_window_index"
+            ) == window_index
+        ):
+            previous = merged[-1]
+
+            previous["source"] = (
+                _merge_chinese_caption_parts(
+                    previous.get("source", ""),
+                    source,
+                )
+            )
+
+            previous["start"] = min(
+                float(previous["start"]),
+                speech_start,
+            )
+
+            previous["end"] = max(
+                float(previous["end"]),
+                speech_end,
+            )
+
+            previous[
+                "recognized_speech"
+            ] = str(
+                window.get("text") or ""
+            )
+
+            continue
 
         updated = dict(item)
+
         updated["start"] = speech_start
-        updated["end"] = speech_end
-        updated["speech_sync_source"] = "chinese_audio"
-        updated["recognized_speech"] = str(
-            selected.get("text") or ""
+        updated["end"] = max(
+            speech_start + 0.35,
+            speech_end,
+        )
+        updated["source"] = source
+        updated[
+            "speech_sync_source"
+        ] = "chinese_audio_turn"
+        updated[
+            "recognized_speech"
+        ] = str(
+            window.get("text") or ""
+        )
+        updated[
+            "_speech_window_index"
+        ] = window_index
+
+        merged.append(updated)
+
+    # Dọn trường nội bộ trước khi dịch.
+    cleaned: list[dict] = []
+
+    for item in merged:
+        updated = dict(item)
+        updated.pop(
+            "_speech_window_index",
+            None,
         )
 
-        aligned.append(updated)
+        if not str(
+            updated.get("source", "")
+        ).strip():
+            continue
 
-        previous_end = speech_end
-        search_from = min(
-            best_index + 1,
-            len(speech_windows),
-        )
+        cleaned.append(updated)
 
-    return aligned
+    return cleaned
 
 
 def _probe_audio_duration(path: Path) -> float:
@@ -1836,6 +2005,11 @@ def register_autocap_routes(app) -> None:
             "voice_fragment_splitting": False,
             "voice_start_locked_to_caption": True,
             "cumulative_voice_delay_prevention": True,
+            "speech_turn_caption_merge": True,
+            "multiple_ocr_lines_per_speech_turn": True,
+            "caption_overlap_deduplication": True,
+            "translation_after_speech_turn_merge": True,
+            "one_voice_file_per_complete_turn": True,
             "voices": {
                 "female": "vi-VN-HoaiMyNeural",
                 "male": "vi-VN-NamMinhNeural",
