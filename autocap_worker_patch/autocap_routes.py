@@ -25,7 +25,7 @@ from fastapi import File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
 
-VERSION = "NAMI_V147X_SPEECH_TURN_CAPTION_MERGE"
+VERSION = "NAMI_V147Y_AUTO_SUBTITLE_BAND_DETECTION"
 MAX_UPLOAD_BYTES = 120 * 1024 * 1024
 
 _PROCESS_LOCK = Lock()
@@ -1594,96 +1594,224 @@ def _ocr_one_frame(frame_path: Path) -> str:
 
     height, width = image.shape[:2]
 
-    # Video đã xác định:
-    # chữ Trung nằm ở dòng sát đáy.
-    top = max(0, int(height * 0.915))
-    bottom = min(height, int(height * 0.999))
-    left = max(0, int(width * 0.02))
-    right = min(width, int(width * 0.98))
-
-    crop = image[top:bottom, left:right]
-
-    if crop.size == 0:
-        return ""
-
-    enlarged = cv2.resize(
-        crop,
-        None,
-        fx=4.0,
-        fy=4.0,
-        interpolation=cv2.INTER_CUBIC,
-    )
-
-    # Tăng nét chữ trắng có viền đen.
-    blurred = cv2.GaussianBlur(
-        enlarged,
-        (0, 0),
-        1.2,
-    )
-
-    sharpened = cv2.addWeighted(
-        enlarged,
-        1.8,
-        blurred,
-        -0.8,
-        0,
-    )
-
-    rapid_candidates = [
-        _rapid_ocr_candidate(enlarged),
-        _rapid_ocr_candidate(sharpened),
+    # Tự kiểm tra nhiều vị trí phụ đề.
+    # Vùng đầu tiên giữ nguyên video cũ.
+    subtitle_bands = [
+        {
+            "name": "exact_bottom",
+            "top": 0.915,
+            "bottom": 0.999,
+            "priority": 3,
+        },
+        {
+            "name": "lower_middle",
+            "top": 0.68,
+            "bottom": 0.90,
+            "priority": 2,
+        },
+        {
+            "name": "middle",
+            "top": 0.52,
+            "bottom": 0.78,
+            "priority": 1,
+        },
     ]
 
-    rapid_candidates = [
-        value
-        for value in rapid_candidates
-        if _is_valid_caption_text(value)
+    rapid_results: list[dict] = []
+    prepared_bands: list[dict] = []
+
+    for band in subtitle_bands:
+        top = max(
+            0,
+            int(height * float(band["top"])),
+        )
+        bottom = min(
+            height,
+            int(height * float(band["bottom"])),
+        )
+        left = max(
+            0,
+            int(width * 0.02),
+        )
+        right = min(
+            width,
+            int(width * 0.98),
+        )
+
+        crop = image[
+            top:bottom,
+            left:right,
+        ]
+
+        if crop.size == 0:
+            continue
+
+        enlarged = cv2.resize(
+            crop,
+            None,
+            fx=4.0,
+            fy=4.0,
+            interpolation=cv2.INTER_CUBIC,
+        )
+
+        blurred = cv2.GaussianBlur(
+            enlarged,
+            (0, 0),
+            1.2,
+        )
+
+        sharpened = cv2.addWeighted(
+            enlarged,
+            1.8,
+            blurred,
+            -0.8,
+            0,
+        )
+
+        prepared_bands.append({
+            "name": band["name"],
+            "priority": band["priority"],
+            "enlarged": enlarged,
+            "sharpened": sharpened,
+        })
+
+        # Trước tiên chỉ chạy một lượt RapidOCR
+        # cho mỗi vùng để tránh tăng thời gian quá mạnh.
+        value = _rapid_ocr_candidate(
+            enlarged
+        )
+
+        if _is_valid_caption_text(value):
+            rapid_results.append({
+                "text": value,
+                "band": band["name"],
+                "priority": band["priority"],
+                "quality": (
+                    _is_high_quality_chinese_caption(
+                        value
+                    )
+                ),
+            })
+
+    high_quality_rapid = [
+        result
+        for result in rapid_results
+        if result["quality"]
     ]
 
-    if rapid_candidates:
-        return max(
-            rapid_candidates,
-            key=lambda value: (
-                _cjk_count(value),
-                len(value),
+    if high_quality_rapid:
+        selected = max(
+            high_quality_rapid,
+            key=lambda result: (
+                _cjk_count(result["text"]),
+                len(result["text"]),
+                result["priority"],
             ),
         )
 
-    # Chỉ dùng Tesseract khi RapidOCR không cho kết quả.
-    gray = cv2.cvtColor(
-        sharpened,
-        cv2.COLOR_BGR2GRAY,
-    )
+        return str(selected["text"])
 
-    threshold = cv2.threshold(
-        gray,
-        0,
-        255,
-        cv2.THRESH_BINARY
-        + cv2.THRESH_OTSU,
-    )[1]
+    # Nếu ảnh gốc chưa đọc tốt, thử ảnh tăng nét.
+    sharpened_results: list[dict] = []
 
-    fallback_candidates = [
-        _tesseract_fallback_candidate(gray),
-        _tesseract_fallback_candidate(threshold),
+    for prepared in prepared_bands:
+        value = _rapid_ocr_candidate(
+            prepared["sharpened"]
+        )
+
+        if not _is_valid_caption_text(value):
+            continue
+
+        sharpened_results.append({
+            "text": value,
+            "band": prepared["name"],
+            "priority": prepared["priority"],
+            "quality": (
+                _is_high_quality_chinese_caption(
+                    value
+                )
+            ),
+        })
+
+    high_quality_sharpened = [
+        result
+        for result in sharpened_results
+        if result["quality"]
     ]
 
-    fallback_candidates = [
-        value
-        for value in fallback_candidates
-        if _is_valid_caption_text(value)
+    if high_quality_sharpened:
+        selected = max(
+            high_quality_sharpened,
+            key=lambda result: (
+                _cjk_count(result["text"]),
+                len(result["text"]),
+                result["priority"],
+            ),
+        )
+
+        return str(selected["text"])
+
+    # Tesseract chỉ chạy khi RapidOCR ở tất cả
+    # các vùng đều không tìm được câu Trung tốt.
+    fallback_results: list[dict] = []
+
+    for prepared in prepared_bands:
+        gray = cv2.cvtColor(
+            prepared["sharpened"],
+            cv2.COLOR_BGR2GRAY,
+        )
+
+        threshold = cv2.threshold(
+            gray,
+            0,
+            255,
+            cv2.THRESH_BINARY
+            + cv2.THRESH_OTSU,
+        )[1]
+
+        for processed in (
+            gray,
+            threshold,
+        ):
+            value = (
+                _tesseract_fallback_candidate(
+                    processed
+                )
+            )
+
+            if not _is_valid_caption_text(value):
+                continue
+
+            fallback_results.append({
+                "text": value,
+                "priority": prepared["priority"],
+                "quality": (
+                    _is_high_quality_chinese_caption(
+                        value
+                    )
+                ),
+            })
+
+    high_quality_fallback = [
+        result
+        for result in fallback_results
+        if result["quality"]
     ]
 
-    if not fallback_candidates:
-        return ""
+    if high_quality_fallback:
+        selected = max(
+            high_quality_fallback,
+            key=lambda result: (
+                _cjk_count(result["text"]),
+                len(result["text"]),
+                result["priority"],
+            ),
+        )
 
-    return max(
-        fallback_candidates,
-        key=lambda value: (
-            _cjk_count(value),
-            len(value),
-        ),
-    )
+        return str(selected["text"])
+
+    # Không trả chữ rác hoặc watermark về pipeline.
+    return ""
 
 
 def _is_high_quality_chinese_caption(
@@ -1949,10 +2077,10 @@ def register_autocap_routes(app) -> None:
             "recognition_primary": "chinese_caption_ocr",
             "recognition_fallback": "whisper",
             "diagnostic_endpoint": "/autocap/diagnose",
-            "ocr_band_mode": "rapidocr_exact_bottom_line",
+            "ocr_band_mode": "rapidocr_auto_multi_band",
             "ocr_sampling_fps": 1,
-            "ocr_candidate_bands": 1,
-            "ocr_vertical_range": "91.5%-99.9%",
+            "ocr_candidate_bands": 3,
+            "ocr_vertical_range": "auto:52%-78%,68%-90%,91.5%-99.9%",
             "ocr_horizontal_range": "4%-96%",
             "ocr_language": "chi_sim",
             "ocr_engine_primary": "rapidocr_onnxruntime",
@@ -1965,6 +2093,12 @@ def register_autocap_routes(app) -> None:
             "vietnamese_line_excluded": True,
             "ocr_text_line_count": 1,
             "ocr_caption_stabilizer": True,
+            "auto_subtitle_band_detection": True,
+            "subtitle_band_per_frame_scoring": True,
+            "exact_bottom_band_preserved": True,
+            "lower_middle_subtitle_support": True,
+            "middle_subtitle_support": True,
+            "watermark_rejection_after_band_scan": True,
             "ocr_frame_interval_seconds": 1.0,
             "ocr_group_max_gap_seconds": 1.6,
             "subtitle_timing_source": "chinese_speech",
