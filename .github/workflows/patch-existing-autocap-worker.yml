@@ -136,24 +136,24 @@ jobs:
             echo "AUTOCAP_HEALTH_STATUS=$NEW_STATUS"
 
             ACTUAL_VERSION="$(
-              python - <<'PYJSON'
+              python -c '
 import json
 from pathlib import Path
-
-path = Path("/tmp/autocap-health.json")
-
 try:
-    data = json.loads(path.read_text())
+    data = json.loads(
+        Path("/tmp/autocap-health.json")
+        .read_text()
+    )
     print(data.get("version", ""))
 except Exception:
     print("")
-PYJSON
+'
             )"
 
             echo "ACTUAL_VERSION=$ACTUAL_VERSION"
 
             EXPECTED_VERSION="$(
-              grep -E '^VERSION = '                 autocap_worker_patch/autocap_routes.py |
+              grep -E '^VERSION = ' autocap_worker_patch/autocap_routes.py |
               head -n 1 |
               sed -E 's/^VERSION = "([^"]+)"/\1/'
             )"
