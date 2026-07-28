@@ -6,6 +6,7 @@ on:
       - main
     paths:
       - "autocap_worker_patch/**"
+      - ".github/scripts/deploy_autocap_space.py"
       - ".github/workflows/patch-existing-autocap-worker.yml"
   workflow_dispatch:
 
@@ -15,7 +16,7 @@ permissions:
 jobs:
   patch-worker:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 50
 
     steps:
       - name: Checkout source
@@ -26,180 +27,51 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Validate source files
+      - name: Validate source
         run: |
           set -euo pipefail
-
           test -s autocap_worker_patch/app.py
           test -s autocap_worker_patch/autocap_routes.py
           test -s autocap_worker_patch/requirements.txt
           test -s autocap_worker_patch/Dockerfile
-
-          python -m py_compile \
-            autocap_worker_patch/app.py \
-            autocap_worker_patch/autocap_routes.py
-
-          EXPECTED_VERSION="$(
-            grep -E '^VERSION = "' \
-              autocap_worker_patch/autocap_routes.py |
-            head -n 1 |
-            cut -d'"' -f2
-          )"
-
-          test -n "$EXPECTED_VERSION"
-
-          echo "EXPECTED_VERSION=$EXPECTED_VERSION"
+          test -s .github/scripts/deploy_autocap_space.py
+          python -m py_compile autocap_worker_patch/app.py autocap_worker_patch/autocap_routes.py .github/scripts/deploy_autocap_space.py
+          grep -E '^VERSION = "' autocap_worker_patch/autocap_routes.py
           echo "SOURCE_VALIDATION=PASS"
 
-      - name: Upload AutoCap worker files
+      - name: Install deploy client
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --no-input huggingface_hub
+
+      - name: Upload worker to Hugging Face
         env:
           HF_TOKEN_B64: ${{ secrets.NAMI_HF_TOKEN_B64 }}
           AUTOCAP_KEY_B64: ${{ secrets.NAMI_AUTOCAP_KEY_B64 }}
         run: |
           set -euo pipefail
-
           test -n "$HF_TOKEN_B64"
           test -n "$AUTOCAP_KEY_B64"
-
-          HF_TOKEN="$(
-            printf '%s' "$HF_TOKEN_B64" |
-            base64 --decode
-          )"
-
-          AUTOCAP_KEY="$(
-            printf '%s' "$AUTOCAP_KEY_B64" |
-            base64 --decode
-          )"
-
-          export HF_TOKEN
-          export AUTOCAP_KEY
-
-          python -m pip install \
-            --disable-pip-version-check \
-            --no-input \
-            huggingface_hub
-
-          cat > /tmp/upload_space.py <<'PY'
-import os
-
-from huggingface_hub import (
-    CommitOperationAdd,
-    HfApi,
-)
-
-repo_id = "Cthuunghiacity/nc-ai-money-worker"
-
-api = HfApi(
-    token=os.environ["HF_TOKEN"],
-)
-
-operations = [
-    CommitOperationAdd(
-        path_in_repo="app.py",
-        path_or_fileobj=(
-            "autocap_worker_patch/app.py"
-        ),
-    ),
-    CommitOperationAdd(
-        path_in_repo="autocap_routes.py",
-        path_or_fileobj=(
-            "autocap_worker_patch/"
-            "autocap_routes.py"
-        ),
-    ),
-    CommitOperationAdd(
-        path_in_repo="requirements.txt",
-        path_or_fileobj=(
-            "autocap_worker_patch/"
-            "requirements.txt"
-        ),
-    ),
-    CommitOperationAdd(
-        path_in_repo="Dockerfile",
-        path_or_fileobj=(
-            "autocap_worker_patch/"
-            "Dockerfile"
-        ),
-    ),
-]
-
-result = api.create_commit(
-    repo_id=repo_id,
-    repo_type="space",
-    operations=operations,
-    commit_message=(
-        "deploy NAMI AutoCap worker"
-    ),
-)
-
-api.add_space_secret(
-    repo_id=repo_id,
-    key="NAMI_AUTOCAP_KEY",
-    value=os.environ["AUTOCAP_KEY"],
-)
-
-print(
-    "HF_COMMIT_URL="
-    + str(result.commit_url)
-)
-print("AUTOCAP_MODULE_UPLOADED=PASS")
-print("AUTOCAP_SECRET_CONFIGURED=PASS")
-PY
-
-          python /tmp/upload_space.py
+          export HF_TOKEN="$(printf '%s' "$HF_TOKEN_B64" | base64 --decode)"
+          export AUTOCAP_KEY="$(printf '%s' "$AUTOCAP_KEY_B64" | base64 --decode)"
+          python .github/scripts/deploy_autocap_space.py
 
       - name: Wait for exact worker version
         run: |
           set -euo pipefail
-
           BASE="https://cthuunghiacity-nc-ai-money-worker.hf.space"
-
-          EXPECTED_VERSION="$(
-            grep -E '^VERSION = "' \
-              autocap_worker_patch/autocap_routes.py |
-            head -n 1 |
-            cut -d'"' -f2
-          )"
-
+          EXPECTED_VERSION="$(grep -E '^VERSION = "' autocap_worker_patch/autocap_routes.py | head -n 1 | cut -d'"' -f2)"
+          test -n "$EXPECTED_VERSION"
           echo "EXPECTED_VERSION=$EXPECTED_VERSION"
 
           for attempt in $(seq 1 120); do
-            HTTP_CODE="$(
-              curl \
-                --silent \
-                --output /tmp/autocap-health.json \
-                --write-out '%{http_code}' \
-                --max-time 30 \
-                "$BASE/autocap/health" || true
-            )"
+            HTTP_CODE="$(curl --silent --output /tmp/health.json --write-out '%{http_code}' --max-time 30 "$BASE/autocap/health" || true)"
+            ACTUAL_VERSION="$(python -c 'import json; from pathlib import Path; p=Path("/tmp/health.json"); print(json.loads(p.read_text()).get("version","") if p.is_file() else "")' 2>/dev/null || true)"
 
-            ACTUAL_VERSION="$(
-              python -c '
-import json
-from pathlib import Path
+            echo "ATTEMPT=$attempt HTTP_CODE=$HTTP_CODE ACTUAL_VERSION=$ACTUAL_VERSION"
 
-try:
-    data = json.loads(
-        Path(
-            "/tmp/autocap-health.json"
-        ).read_text()
-    )
-    print(data.get("version", ""))
-except Exception:
-    print("")
-'
-            )"
-
-            echo \
-              "ATTEMPT=$attempt" \
-              "HTTP_CODE=$HTTP_CODE" \
-              "ACTUAL_VERSION=$ACTUAL_VERSION"
-
-            if \
-              [ "$HTTP_CODE" = "200" ] && \
-              [ "$ACTUAL_VERSION" = "$EXPECTED_VERSION" ]
-            then
-              cat /tmp/autocap-health.json
+            if [ "$HTTP_CODE" = "200" ] && [ "$ACTUAL_VERSION" = "$EXPECTED_VERSION" ]; then
+              cat /tmp/health.json
               echo
               echo "AUTOCAP_EXPECTED_VERSION=PASS"
               exit 0
