@@ -135,18 +135,46 @@ jobs:
             echo "OLD_HEALTH_STATUS=$OLD_STATUS"
             echo "AUTOCAP_HEALTH_STATUS=$NEW_STATUS"
 
+            ACTUAL_VERSION="$(
+              python - <<'PYJSON'
+import json
+from pathlib import Path
+
+path = Path("/tmp/autocap-health.json")
+
+try:
+    data = json.loads(path.read_text())
+    print(data.get("version", ""))
+except Exception:
+    print("")
+PYJSON
+            )"
+
+            echo "ACTUAL_VERSION=$ACTUAL_VERSION"
+
+            EXPECTED_VERSION="$(
+              grep -E '^VERSION = '                 autocap_worker_patch/autocap_routes.py |
+              head -n 1 |
+              sed -E 's/^VERSION = "([^"]+)"/\1/'
+            )"
+
+            echo "EXPECTED_VERSION=$EXPECTED_VERSION"
+
             if (
               [ "$OLD_STATUS" = "200" ] &&
-              [ "$NEW_STATUS" = "200" ]
+              [ "$NEW_STATUS" = "200" ] &&
+              [ "$ACTUAL_VERSION" = "$EXPECTED_VERSION" ]
             ); then
               cat /tmp/old-health.json
               echo
               cat /tmp/autocap-health.json
               echo
               echo "OLD_WORKER_HEALTH_PRESERVED=PASS"
-              echo "AUTOCAP_WORKER_HEALTH=PASS"
+              echo "AUTOCAP_EXPECTED_VERSION=PASS"
               exit 0
             fi
+
+            echo "WORKER_NOT_ON_EXPECTED_VERSION_YET"
 
             sleep 20
           done
