@@ -11,13 +11,13 @@ RUN pip install --no-cache-dir \
     torch==2.7.1
 
 RUN mkdir -p \
-    /opt/nami_models/opus-mt-zh-vi-ct2 \
     /opt/nami_models/opus-mt-zh-vi-tokenizer
 
 RUN ct2-transformers-converter \
     --model Helsinki-NLP/opus-mt-zh-vi \
     --output_dir /opt/nami_models/opus-mt-zh-vi-ct2 \
-    --quantization int8
+    --quantization int8 \
+    --force
 
 RUN python - <<'PY'
 from transformers import AutoTokenizer
