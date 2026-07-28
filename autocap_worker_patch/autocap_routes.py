@@ -25,7 +25,7 @@ from fastapi import File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
 
-VERSION = "NAMI_V147Y_AUTO_SUBTITLE_BAND_DETECTION"
+VERSION = "NAMI_V147ZA_FAST_ADAPTIVE_PIPELINE"
 MAX_UPLOAD_BYTES = 120 * 1024 * 1024
 
 _PROCESS_LOCK = Lock()
@@ -1301,7 +1301,7 @@ def _render_with_dubbing(
         _probe_audio_duration(input_path),
     )
 
-    batch_size = 10
+    batch_size = 24
     batch_tracks: list[Path] = []
 
     for batch_index, start in enumerate(
@@ -1586,232 +1586,267 @@ def _tesseract_fallback_candidate(image) -> str:
     return candidate
 
 
-def _ocr_one_frame(frame_path: Path) -> str:
+FAST_SUBTITLE_BANDS = [
+    {
+        "name": "exact_bottom",
+        "top": 0.915,
+        "bottom": 0.999,
+        "priority": 3,
+    },
+    {
+        "name": "lower_middle",
+        "top": 0.68,
+        "bottom": 0.90,
+        "priority": 2,
+    },
+    {
+        "name": "middle",
+        "top": 0.52,
+        "bottom": 0.78,
+        "priority": 1,
+    },
+]
+
+
+def _prepare_subtitle_crop(
+    image,
+    band: dict,
+):
+    height, width = image.shape[:2]
+
+    top = max(
+        0,
+        int(height * float(band["top"])),
+    )
+    bottom = min(
+        height,
+        int(height * float(band["bottom"])),
+    )
+    left = max(
+        0,
+        int(width * 0.02),
+    )
+    right = min(
+        width,
+        int(width * 0.98),
+    )
+
+    crop = image[
+        top:bottom,
+        left:right,
+    ]
+
+    if crop.size == 0:
+        return None
+
+    return cv2.resize(
+        crop,
+        None,
+        fx=3.0,
+        fy=3.0,
+        interpolation=cv2.INTER_CUBIC,
+    )
+
+
+def _rapid_read_band(
+    image,
+    band: dict,
+    sharpen: bool = False,
+) -> str:
+    enlarged = _prepare_subtitle_crop(
+        image,
+        band,
+    )
+
+    if enlarged is None:
+        return ""
+
+    processed = enlarged
+
+    if sharpen:
+        blurred = cv2.GaussianBlur(
+            enlarged,
+            (0, 0),
+            1.1,
+        )
+
+        processed = cv2.addWeighted(
+            enlarged,
+            1.7,
+            blurred,
+            -0.7,
+            0,
+        )
+
+    value = _rapid_ocr_candidate(processed)
+
+    if not _is_valid_caption_text(value):
+        return ""
+
+    if not _is_high_quality_chinese_caption(
+        value
+    ):
+        return ""
+
+    return value
+
+
+def _detect_best_subtitle_band(
+    frames: list[Path],
+) -> dict:
+    if not frames:
+        return FAST_SUBTITLE_BANDS[0]
+
+    sample_count = min(
+        12,
+        len(frames),
+    )
+
+    if sample_count <= 1:
+        sample_indexes = [0]
+    else:
+        sample_indexes = sorted(set(
+            round(
+                index
+                * (len(frames) - 1)
+                / (sample_count - 1)
+            )
+            for index in range(sample_count)
+        ))
+
+    scores = {
+        band["name"]: {
+            "band": band,
+            "valid_frames": 0,
+            "cjk_total": 0,
+            "priority": int(
+                band["priority"]
+            ),
+        }
+        for band in FAST_SUBTITLE_BANDS
+    }
+
+    for frame_index in sample_indexes:
+        image = cv2.imread(
+            str(frames[frame_index])
+        )
+
+        if image is None:
+            continue
+
+        for band in FAST_SUBTITLE_BANDS:
+            value = _rapid_read_band(
+                image,
+                band,
+                sharpen=False,
+            )
+
+            if not value:
+                continue
+
+            score = scores[band["name"]]
+            score["valid_frames"] += 1
+            score["cjk_total"] += (
+                _cjk_count(value)
+            )
+
+    selected = max(
+        scores.values(),
+        key=lambda item: (
+            item["valid_frames"],
+            item["cjk_total"],
+            item["priority"],
+        ),
+    )
+
+    return dict(selected["band"])
+
+
+def _ocr_one_frame(
+    frame_path: Path,
+    locked_band: dict | None = None,
+    allow_tesseract: bool = False,
+) -> str:
     image = cv2.imread(str(frame_path))
 
     if image is None:
         return ""
 
-    height, width = image.shape[:2]
+    band = (
+        locked_band
+        if locked_band is not None
+        else FAST_SUBTITLE_BANDS[0]
+    )
 
-    # Tự kiểm tra nhiều vị trí phụ đề.
-    # Vùng đầu tiên giữ nguyên video cũ.
-    subtitle_bands = [
-        {
-            "name": "exact_bottom",
-            "top": 0.915,
-            "bottom": 0.999,
-            "priority": 3,
-        },
-        {
-            "name": "lower_middle",
-            "top": 0.68,
-            "bottom": 0.90,
-            "priority": 2,
-        },
-        {
-            "name": "middle",
-            "top": 0.52,
-            "bottom": 0.78,
-            "priority": 1,
-        },
+    # Fast path: chỉ một vùng, một lượt RapidOCR.
+    value = _rapid_read_band(
+        image,
+        band,
+        sharpen=False,
+    )
+
+    if value:
+        return value
+
+    # Chỉ thử ảnh tăng nét khi lượt nhanh thất bại.
+    value = _rapid_read_band(
+        image,
+        band,
+        sharpen=True,
+    )
+
+    if value:
+        return value
+
+    if not allow_tesseract:
+        return ""
+
+    enlarged = _prepare_subtitle_crop(
+        image,
+        band,
+    )
+
+    if enlarged is None:
+        return ""
+
+    gray = cv2.cvtColor(
+        enlarged,
+        cv2.COLOR_BGR2GRAY,
+    )
+
+    threshold = cv2.threshold(
+        gray,
+        0,
+        255,
+        cv2.THRESH_BINARY
+        + cv2.THRESH_OTSU,
+    )[1]
+
+    candidates = [
+        _tesseract_fallback_candidate(gray),
+        _tesseract_fallback_candidate(
+            threshold
+        ),
     ]
 
-    rapid_results: list[dict] = []
-    prepared_bands: list[dict] = []
-
-    for band in subtitle_bands:
-        top = max(
-            0,
-            int(height * float(band["top"])),
+    candidates = [
+        candidate
+        for candidate in candidates
+        if _is_high_quality_chinese_caption(
+            candidate
         )
-        bottom = min(
-            height,
-            int(height * float(band["bottom"])),
-        )
-        left = max(
-            0,
-            int(width * 0.02),
-        )
-        right = min(
-            width,
-            int(width * 0.98),
-        )
-
-        crop = image[
-            top:bottom,
-            left:right,
-        ]
-
-        if crop.size == 0:
-            continue
-
-        enlarged = cv2.resize(
-            crop,
-            None,
-            fx=4.0,
-            fy=4.0,
-            interpolation=cv2.INTER_CUBIC,
-        )
-
-        blurred = cv2.GaussianBlur(
-            enlarged,
-            (0, 0),
-            1.2,
-        )
-
-        sharpened = cv2.addWeighted(
-            enlarged,
-            1.8,
-            blurred,
-            -0.8,
-            0,
-        )
-
-        prepared_bands.append({
-            "name": band["name"],
-            "priority": band["priority"],
-            "enlarged": enlarged,
-            "sharpened": sharpened,
-        })
-
-        # Trước tiên chỉ chạy một lượt RapidOCR
-        # cho mỗi vùng để tránh tăng thời gian quá mạnh.
-        value = _rapid_ocr_candidate(
-            enlarged
-        )
-
-        if _is_valid_caption_text(value):
-            rapid_results.append({
-                "text": value,
-                "band": band["name"],
-                "priority": band["priority"],
-                "quality": (
-                    _is_high_quality_chinese_caption(
-                        value
-                    )
-                ),
-            })
-
-    high_quality_rapid = [
-        result
-        for result in rapid_results
-        if result["quality"]
     ]
 
-    if high_quality_rapid:
-        selected = max(
-            high_quality_rapid,
-            key=lambda result: (
-                _cjk_count(result["text"]),
-                len(result["text"]),
-                result["priority"],
-            ),
-        )
+    if not candidates:
+        return ""
 
-        return str(selected["text"])
-
-    # Nếu ảnh gốc chưa đọc tốt, thử ảnh tăng nét.
-    sharpened_results: list[dict] = []
-
-    for prepared in prepared_bands:
-        value = _rapid_ocr_candidate(
-            prepared["sharpened"]
-        )
-
-        if not _is_valid_caption_text(value):
-            continue
-
-        sharpened_results.append({
-            "text": value,
-            "band": prepared["name"],
-            "priority": prepared["priority"],
-            "quality": (
-                _is_high_quality_chinese_caption(
-                    value
-                )
-            ),
-        })
-
-    high_quality_sharpened = [
-        result
-        for result in sharpened_results
-        if result["quality"]
-    ]
-
-    if high_quality_sharpened:
-        selected = max(
-            high_quality_sharpened,
-            key=lambda result: (
-                _cjk_count(result["text"]),
-                len(result["text"]),
-                result["priority"],
-            ),
-        )
-
-        return str(selected["text"])
-
-    # Tesseract chỉ chạy khi RapidOCR ở tất cả
-    # các vùng đều không tìm được câu Trung tốt.
-    fallback_results: list[dict] = []
-
-    for prepared in prepared_bands:
-        gray = cv2.cvtColor(
-            prepared["sharpened"],
-            cv2.COLOR_BGR2GRAY,
-        )
-
-        threshold = cv2.threshold(
-            gray,
-            0,
-            255,
-            cv2.THRESH_BINARY
-            + cv2.THRESH_OTSU,
-        )[1]
-
-        for processed in (
-            gray,
-            threshold,
-        ):
-            value = (
-                _tesseract_fallback_candidate(
-                    processed
-                )
-            )
-
-            if not _is_valid_caption_text(value):
-                continue
-
-            fallback_results.append({
-                "text": value,
-                "priority": prepared["priority"],
-                "quality": (
-                    _is_high_quality_chinese_caption(
-                        value
-                    )
-                ),
-            })
-
-    high_quality_fallback = [
-        result
-        for result in fallback_results
-        if result["quality"]
-    ]
-
-    if high_quality_fallback:
-        selected = max(
-            high_quality_fallback,
-            key=lambda result: (
-                _cjk_count(result["text"]),
-                len(result["text"]),
-                result["priority"],
-            ),
-        )
-
-        return str(selected["text"])
-
-    # Không trả chữ rác hoặc watermark về pipeline.
-    return ""
+    return max(
+        candidates,
+        key=lambda candidate: (
+            _cjk_count(candidate),
+            len(candidate),
+        ),
+    )
 
 
 def _is_high_quality_chinese_caption(
@@ -1905,15 +1940,44 @@ def _extract_ocr_items(
 
     samples = []
 
+    band_started = time.perf_counter()
+
+    locked_band = _detect_best_subtitle_band(
+        frames
+    )
+
+    print(
+        "NAMI_FAST_BAND="
+        + str(locked_band.get("name", "unknown"))
+        + " detection_seconds="
+        + f"{time.perf_counter() - band_started:.3f}",
+        flush=True,
+    )
+
+    miss_streak = 0
+
     for index, frame_path in enumerate(
         frames
     ):
         # fps=1 nên mỗi khung cách nhau đúng 1 giây.
         timestamp = index * 1.0
-        detected = _ocr_one_frame(frame_path)
+
+        # Tesseract chỉ được phép chạy khi RapidOCR
+        # đã hụt ít nhất ba khung liên tiếp.
+        detected = _ocr_one_frame(
+            frame_path,
+            locked_band=locked_band,
+            allow_tesseract=(
+                miss_streak >= 3
+                and index % 4 == 0
+            ),
+        )
 
         if not _is_valid_caption_text(detected):
+            miss_streak += 1
             continue
+
+        miss_streak = 0
 
         samples.append({
             "time": timestamp,
@@ -2077,7 +2141,7 @@ def register_autocap_routes(app) -> None:
             "recognition_primary": "chinese_caption_ocr",
             "recognition_fallback": "whisper",
             "diagnostic_endpoint": "/autocap/diagnose",
-            "ocr_band_mode": "rapidocr_auto_multi_band",
+            "ocr_band_mode": "rapidocr_fast_locked_band",
             "ocr_sampling_fps": 1,
             "ocr_candidate_bands": 3,
             "ocr_vertical_range": "auto:52%-78%,68%-90%,91.5%-99.9%",
@@ -2094,7 +2158,9 @@ def register_autocap_routes(app) -> None:
             "ocr_text_line_count": 1,
             "ocr_caption_stabilizer": True,
             "auto_subtitle_band_detection": True,
-            "subtitle_band_per_frame_scoring": True,
+            "subtitle_band_per_frame_scoring": False,
+            "subtitle_band_representative_scan": True,
+            "subtitle_band_locked_after_detection": True,
             "exact_bottom_band_preserved": True,
             "lower_middle_subtitle_support": True,
             "middle_subtitle_support": True,
@@ -2110,7 +2176,6 @@ def register_autocap_routes(app) -> None:
             "voice_overlap_prevention": True,
             "dubbing_batch_size": 10,
             "tts_batch_size": 8,
-            "tts_concurrency": 4,
             "tts_retry_count": 3,
             "original_audio_volume": 0.14,
             "maximum_dubbing_speed": 1.35,
@@ -2144,6 +2209,14 @@ def register_autocap_routes(app) -> None:
             "caption_overlap_deduplication": True,
             "translation_after_speech_turn_merge": True,
             "one_voice_file_per_complete_turn": True,
+            "fast_adaptive_pipeline": True,
+            "representative_band_sample_frames": 12,
+            "rapidocr_single_band_per_frame": True,
+            "tesseract_sparse_fallback": True,
+            "tts_global_queue": True,
+            "tts_concurrency": 6,
+            "voice_mix_batch_size": 24,
+            "stage_timing_metrics": True,
             "voices": {
                 "female": "vi-VN-HoaiMyNeural",
                 "male": "vi-VN-NamMinhNeural",
@@ -2206,9 +2279,21 @@ def register_autocap_routes(app) -> None:
                         detail="Video is empty",
                     )
 
+                pipeline_started = time.perf_counter()
+
+                stage_started = time.perf_counter()
+
                 items = _extract_ocr_items(
                     input_path,
                     job_dir,
+                )
+
+                print(
+                    "NAMI_TIMING ocr_seconds="
+                    + f"{time.perf_counter() - stage_started:.3f}"
+                    + " ocr_items="
+                    + str(len(items)),
+                    flush=True,
                 )
 
                 recognition_source = "ocr"
@@ -2555,10 +2640,20 @@ def register_autocap_routes(app) -> None:
                         item.get("source", "")
                     ).strip()
 
+                stage_started = time.perf_counter()
+
                 translations = _translate_batch([
                     item["translation_source"]
                     for item in items
                 ])
+
+                print(
+                    "NAMI_TIMING translation_seconds="
+                    + f"{time.perf_counter() - stage_started:.3f}"
+                    + " translation_items="
+                    + str(len(translations)),
+                    flush=True,
+                )
 
                 compact_items = []
 
@@ -2703,30 +2798,39 @@ def register_autocap_routes(app) -> None:
                             duration_ms,
                         ))
 
-                    # Tạo giọng từng cụm nhỏ, tối đa
-                    # bốn kết nối TTS chạy đồng thời.
-                    tts_batch_size = 8
+                    # V147ZA: đưa toàn bộ câu vào
+                    # một hàng đợi; semaphore giới hạn
+                    # sáu kết nối chạy đồng thời.
+                    stage_started = time.perf_counter()
 
-                    for start in range(
-                        0,
-                        len(tts_jobs),
-                        tts_batch_size,
-                    ):
-                        asyncio.run(
-                            _create_voice_batch(
-                                tts_jobs[
-                                    start:
-                                    start + tts_batch_size
-                                ],
-                                concurrency=4,
-                            )
+                    asyncio.run(
+                        _create_voice_batch(
+                            tts_jobs,
+                            concurrency=6,
                         )
+                    )
+
+                    print(
+                        "NAMI_TIMING tts_seconds="
+                        + f"{time.perf_counter() - stage_started:.3f}"
+                        + " tts_items="
+                        + str(len(tts_jobs)),
+                        flush=True,
+                    )
+
+                    stage_started = time.perf_counter()
 
                     _render_with_dubbing(
                         input_path,
                         srt_path,
                         voice_files,
                         output_path,
+                    )
+
+                    print(
+                        "NAMI_TIMING render_seconds="
+                        + f"{time.perf_counter() - stage_started:.3f}",
+                        flush=True,
                     )
                 else:
                     _render_subtitle_only(
@@ -2746,10 +2850,28 @@ def register_autocap_routes(app) -> None:
                     else "NAMI_AutoCap_vietsub.mp4"
                 )
 
+                total_seconds = (
+                    time.perf_counter()
+                    - pipeline_started
+                )
+
+                print(
+                    "NAMI_TIMING total_seconds="
+                    + f"{total_seconds:.3f}"
+                    + " mode="
+                    + mode,
+                    flush=True,
+                )
+
                 return FileResponse(
                     path=str(output_path),
                     media_type="video/mp4",
                     filename=filename,
+                    headers={
+                        "X-NAMI-Processing-Seconds":
+                            f"{total_seconds:.3f}",
+                        "X-NAMI-Version": VERSION,
+                    },
                 )
 
             except HTTPException:
