@@ -3,8 +3,11 @@ uvicorn[standard]
 Pillow
 python-multipart==0.0.20
 faster-whisper==1.1.1
-deep-translator==1.11.4
 edge-tts==7.2.3
 pytesseract==0.3.13
 opencv-python-headless==4.11.0.86
 rapidocr-onnxruntime==1.4.4
+transformers==4.53.2
+sentencepiece==0.2.0
+sacremoses==0.1.1
+torch==2.7.1

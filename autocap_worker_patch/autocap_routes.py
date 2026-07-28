@@ -20,17 +20,24 @@ from pathlib import Path
 from threading import Lock
 
 import edge_tts
-from deep_translator import GoogleTranslator
 from fastapi import File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
+from transformers import pipeline
 
-VERSION = "NAMI_V147ZB_FAST_NO_FULL_AUDIO_SYNC"
+VERSION = "NAMI_V147ZC_LOCAL_CHINESE_VIETNAMESE_TRANSLATION"
 MAX_UPLOAD_BYTES = 120 * 1024 * 1024
 
 _PROCESS_LOCK = Lock()
 _MODEL_LOCK = Lock()
 _WHISPER_MODEL = None
+
+_LOCAL_TRANSLATOR = None
+_LOCAL_TRANSLATOR_LOCK = Lock()
+_LOCAL_TRANSLATION_CACHE: dict[str, str] = {}
+_LOCAL_TRANSLATION_MODEL = (
+    "Helsinki-NLP/opus-mt-zh-vi"
+)
 
 
 def _load_whisper():
@@ -48,6 +55,39 @@ def _load_whisper():
 
     return _WHISPER_MODEL
 
+
+
+def _load_local_translator():
+    global _LOCAL_TRANSLATOR
+
+    with _LOCAL_TRANSLATOR_LOCK:
+        if _LOCAL_TRANSLATOR is None:
+            started = time.perf_counter()
+
+            _LOCAL_TRANSLATOR = pipeline(
+                "translation",
+                model=_LOCAL_TRANSLATION_MODEL,
+                device=-1,
+            )
+
+            print(
+                "NAMI_LOCAL_TRANSLATOR_LOADED=true"
+                + " model="
+                + _LOCAL_TRANSLATION_MODEL
+                + " load_seconds="
+                + f"{time.perf_counter() - started:.3f}",
+                flush=True,
+            )
+
+    return _LOCAL_TRANSLATOR
+
+
+def _clean_local_translation(
+    value: str,
+) -> str:
+    return " ".join(
+        str(value or "").split()
+    ).strip()
 
 def _check_owner_key(value: str | None) -> None:
     expected = os.environ.get("NAMI_AUTOCAP_KEY", "").strip()
@@ -705,154 +745,147 @@ def _translate_batch(
     texts: list[str],
 ) -> list[str]:
     sources = [
-        " ".join(str(value or "").split()).strip()
+        " ".join(
+            str(value or "").split()
+        ).strip()
         for value in texts
     ]
 
-    results = ["" for _ in sources]
-    batch_size = 10
-
-    # Dịch theo cụm nhỏ để tránh một lỗi mạng
-    # làm trống toàn bộ 72 câu.
-    for batch_start in range(
-        0,
-        len(sources),
-        batch_size,
-    ):
-        indexes = list(range(
-            batch_start,
-            min(
-                len(sources),
-                batch_start + batch_size,
-            ),
-        ))
-
-        pending = [
-            index
-            for index in indexes
-            if sources[index]
-        ]
-
-        for attempt in range(4):
-            if not pending:
-                break
-
-            source_language = (
-                "zh-CN"
-                if attempt < 2
-                else "auto"
-            )
-
-            translator = GoogleTranslator(
-                source=source_language,
-                target="vi",
-            )
-
-            batch_texts = [
-                sources[index]
-                for index in pending
-            ]
-
-            translated_values = None
-
-            try:
-                translated_values = (
-                    translator.translate_batch(
-                        batch_texts
-                    )
-                )
-            except Exception:
-                translated_values = None
-
-            next_pending = []
-
-            if (
-                isinstance(translated_values, list)
-                and len(translated_values)
-                == len(pending)
-            ):
-                for index, translated in zip(
-                    pending,
-                    translated_values,
-                ):
-                    value = " ".join(
-                        str(translated or "").split()
-                    ).strip()
-
-                    if _translation_is_valid(
-                        sources[index],
-                        value,
-                    ):
-                        results[index] = value
-                    else:
-                        next_pending.append(index)
-            else:
-                next_pending = list(pending)
-
-            pending = next_pending
-
-            if pending:
-                time.sleep(
-                    1.0 + attempt * 1.5
-                )
-
-        # Những câu cụm vẫn lỗi được dịch riêng
-        # từng câu, tạo translator mới mỗi lượt.
-        for index in list(pending):
-            for attempt in range(5):
-                source_language = (
-                    "zh-CN"
-                    if attempt < 3
-                    else "auto"
-                )
-
-                try:
-                    translator = GoogleTranslator(
-                        source=source_language,
-                        target="vi",
-                    )
-
-                    value = translator.translate(
-                        sources[index]
-                    )
-
-                    value = " ".join(
-                        str(value or "").split()
-                    ).strip()
-                except Exception:
-                    value = ""
-
-                if _translation_is_valid(
-                    sources[index],
-                    value,
-                ):
-                    results[index] = value
-                    break
-
-                time.sleep(
-                    1.0 + attempt
-                )
-
-    failed_indexes = [
-        index
-        for index, value in enumerate(results)
-        if sources[index]
-        and not _translation_is_valid(
-            sources[index],
-            value,
-        )
+    results = [
+        ""
+        for _ in sources
     ]
 
-    if failed_indexes:
-        failed_sources = [
-            sources[index]
-            for index in failed_indexes[:5]
-        ]
+    # Chỉ dịch mỗi câu khác nhau một lần.
+    unique_pending: list[str] = []
 
-        raise RuntimeError(
-            "TRANSLATION_INCOMPLETE_AFTER_RETRIES: "
-            + " | ".join(failed_sources)
+    for source in sources:
+        if not source:
+            continue
+
+        cached = _LOCAL_TRANSLATION_CACHE.get(
+            source
         )
+
+        if (
+            cached
+            and _translation_is_valid(
+                source,
+                cached,
+            )
+        ):
+            continue
+
+        if source not in unique_pending:
+            unique_pending.append(source)
+
+    if unique_pending:
+        translator = _load_local_translator()
+
+        # Batch nhỏ để giữ RAM ổn định trên CPU Basic.
+        local_batch_size = 8
+
+        for batch_start in range(
+            0,
+            len(unique_pending),
+            local_batch_size,
+        ):
+            batch = unique_pending[
+                batch_start:
+                batch_start + local_batch_size
+            ]
+
+            started = time.perf_counter()
+
+            try:
+                generated = translator(
+                    batch,
+                    max_length=256,
+                    truncation=True,
+                    batch_size=min(
+                        local_batch_size,
+                        len(batch),
+                    ),
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "LOCAL_TRANSLATION_BATCH_FAILED: "
+                    + str(exc)
+                ) from exc
+
+            if (
+                not isinstance(generated, list)
+                or len(generated) != len(batch)
+            ):
+                raise RuntimeError(
+                    "LOCAL_TRANSLATION_RESULT_COUNT_MISMATCH"
+                )
+
+            for source, result in zip(
+                batch,
+                generated,
+            ):
+                if isinstance(result, dict):
+                    translated = (
+                        result.get(
+                            "translation_text",
+                            "",
+                        )
+                    )
+                else:
+                    translated = ""
+
+                translated = (
+                    _clean_local_translation(
+                        translated
+                    )
+                )
+
+                if not _translation_is_valid(
+                    source,
+                    translated,
+                ):
+                    raise RuntimeError(
+                        "LOCAL_TRANSLATION_INVALID: "
+                        + source
+                    )
+
+                _LOCAL_TRANSLATION_CACHE[
+                    source
+                ] = translated
+
+            print(
+                "NAMI_LOCAL_TRANSLATION_BATCH"
+                + " items="
+                + str(len(batch))
+                + " seconds="
+                + f"{time.perf_counter() - started:.3f}",
+                flush=True,
+            )
+
+    for index, source in enumerate(
+        sources
+    ):
+        if not source:
+            continue
+
+        translated = (
+            _LOCAL_TRANSLATION_CACHE.get(
+                source,
+                "",
+            )
+        )
+
+        if not _translation_is_valid(
+            source,
+            translated,
+        ):
+            raise RuntimeError(
+                "LOCAL_TRANSLATION_MISSING: "
+                + source
+            )
+
+        results[index] = translated
 
     return results
 
@@ -2184,9 +2217,9 @@ def register_autocap_routes(app) -> None:
             "natural_vietnamese_compaction": True,
             "voice_tail_cut_prevention": True,
             "translation_batch_size": 10,
-            "translation_batch_retry_count": 4,
-            "translation_sentence_retry_count": 5,
-            "translation_auto_fallback": True,
+            "translation_batch_retry_count": 0,
+            "translation_sentence_retry_count": 0,
+            "translation_auto_fallback": False,
             "translation_placeholder_allowed": False,
             "natural_dubbing_helpers_restored": True,
             "missing_helper_runtime_guard": True,
@@ -2222,6 +2255,14 @@ def register_autocap_routes(app) -> None:
             "whisper_only_for_sparse_ocr": True,
             "sparse_ocr_audio_sync_threshold": 4,
             "fast_audio_sync_skip": True,
+            "translation_engine": "local_opus_mt_zh_vi",
+            "google_translate_enabled": False,
+            "deep_translator_enabled": False,
+            "translation_network_required": False,
+            "local_translation_model": "Helsinki-NLP/opus-mt-zh-vi",
+            "local_translation_batch_size": 8,
+            "local_translation_cache": True,
+            "translation_retry_sleep_seconds": 0,
             "voices": {
                 "female": "vi-VN-HoaiMyNeural",
                 "male": "vi-VN-NamMinhNeural",
