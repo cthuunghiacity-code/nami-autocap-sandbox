@@ -1,6 +1,12 @@
 package com.nami.autocap;
 
 import android.app.Activity;
+import android.Manifest;
+import android.content.BroadcastReceiver;
+import android.content.Context;
+import android.content.IntentFilter;
+import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
 import android.content.ContentValues;
 import android.content.Intent;
 import android.database.Cursor;
@@ -51,10 +57,106 @@ public final class MainActivity extends Activity {
     private String selectedVideoName = "video.mp4";
     private volatile boolean processing = false;
 
+    private boolean statusReceiverRegistered = false;
+
+    private final BroadcastReceiver statusReceiver =
+        new BroadcastReceiver() {
+            @Override
+            public void onReceive(
+                Context context,
+                Intent intent
+            ) {
+                String state =
+                    intent.getStringExtra(
+                        BackgroundProcessingService
+                            .EXTRA_STATE
+                    );
+
+                String message =
+                    intent.getStringExtra(
+                        BackgroundProcessingService
+                            .EXTRA_MESSAGE
+                    );
+
+                String outputText =
+                    intent.getStringExtra(
+                        BackgroundProcessingService
+                            .EXTRA_OUTPUT_URI
+                    );
+
+                if (message != null) {
+                    statusText.setText(message);
+                }
+
+                if ("completed".equals(state)) {
+                    processing = false;
+                    progressBar.setIndeterminate(false);
+                    progressBar.setProgress(100);
+                    setControlsEnabled(true);
+
+                    Toast.makeText(
+                        MainActivity.this,
+                        "Đã lưu video trong "
+                            + "Movies/NAMI AutoCap",
+                        Toast.LENGTH_LONG
+                    ).show();
+
+                    if (
+                        outputText != null
+                            && !outputText.isEmpty()
+                    ) {
+                        try {
+                            openResult(
+                                Uri.parse(outputText)
+                            );
+                        } catch (Exception ignored) {
+                        }
+                    }
+
+                } else if ("error".equals(state)) {
+                    processing = false;
+                    progressBar.setIndeterminate(false);
+                    progressBar.setProgress(0);
+                    setControlsEnabled(true);
+
+                    Toast.makeText(
+                        MainActivity.this,
+                        "Không xử lý được video.",
+                        Toast.LENGTH_LONG
+                    ).show();
+
+                } else {
+                    processing = true;
+                    progressBar.setIndeterminate(true);
+                    setControlsEnabled(false);
+                }
+            }
+        };
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(createContent());
+
+        registerStatusReceiver();
+        restoreBackgroundState();
+
+        if (
+            Build.VERSION.SDK_INT >= 33
+                && checkSelfPermission(
+                    Manifest.permission
+                        .POST_NOTIFICATIONS
+                ) != PackageManager
+                    .PERMISSION_GRANTED
+        ) {
+            requestPermissions(
+                new String[] {
+                    Manifest.permission
+                        .POST_NOTIFICATIONS
+                },
+                148
+            );
+        }
     }
 
     private View createContent() {
@@ -146,7 +248,7 @@ public final class MainActivity extends Activity {
         root.addView(statusText, spaced());
 
         TextView version = text(
-            "Phiên bản 0.3.0 • V147D",
+            "Phiên bản 0.4.0 • V147Z Background",
             12,
             Color.rgb(130, 136, 150)
         );
@@ -222,56 +324,63 @@ public final class MainActivity extends Activity {
         progressBar.setIndeterminate(true);
 
         statusText.setText(
-            "Trạng thái: Đang tải video lên worker…"
+            "Trạng thái: Đang khởi động "
+                + "xử lý nền…"
         );
 
-        new Thread(() -> {
-            try {
-                Uri result = uploadAndSave();
+        int selectedMode =
+            modeSpinner.getSelectedItemPosition();
 
-                runOnUiThread(() -> {
-                    processing = false;
-                    progressBar.setIndeterminate(false);
-                    progressBar.setProgress(100);
-                    setControlsEnabled(true);
+        String mode =
+            selectedMode == 0
+                ? "subtitle"
+                : "dub";
 
-                    statusText.setText(
-                        "Hoàn tất: Video đã được lưu tại "
-                            + "Movies/NAMI AutoCap/."
-                    );
+        String voice =
+            selectedMode == 2
+                ? "vi-VN-NamMinhNeural"
+                : "vi-VN-HoaiMyNeural";
 
-                    Toast.makeText(
-                        this,
-                        "Đã lưu video trong Movies/NAMI AutoCap",
-                        Toast.LENGTH_LONG
-                    ).show();
+        Intent serviceIntent =
+            new Intent(
+                this,
+                BackgroundProcessingService.class
+            );
 
-                    openResult(result);
-                });
-            } catch (Exception error) {
-                final String message =
-                    error.getMessage() == null
-                        ? error.getClass().getSimpleName()
-                        : error.getMessage();
+        serviceIntent.putExtra(
+            BackgroundProcessingService
+                .EXTRA_VIDEO_URI,
+            selectedVideoUri.toString()
+        );
 
-                runOnUiThread(() -> {
-                    processing = false;
-                    progressBar.setIndeterminate(false);
-                    progressBar.setProgress(0);
-                    setControlsEnabled(true);
+        serviceIntent.putExtra(
+            BackgroundProcessingService
+                .EXTRA_VIDEO_NAME,
+            selectedVideoName
+        );
 
-                    statusText.setText(
-                        "Lỗi xử lý: " + message
-                    );
+        serviceIntent.putExtra(
+            BackgroundProcessingService.EXTRA_MODE,
+            mode
+        );
 
-                    Toast.makeText(
-                        this,
-                        "Không xử lý được video.",
-                        Toast.LENGTH_LONG
-                    ).show();
-                });
-            }
-        }).start();
+        serviceIntent.putExtra(
+            BackgroundProcessingService.EXTRA_VOICE,
+            voice
+        );
+
+        if (Build.VERSION.SDK_INT >= 26) {
+            startForegroundService(serviceIntent);
+        } else {
+            startService(serviceIntent);
+        }
+
+        Toast.makeText(
+            this,
+            "NAMI sẽ tiếp tục chạy khi "
+                + "bạn chuyển sang ứng dụng khác.",
+            Toast.LENGTH_LONG
+        ).show();
     }
 
     private Uri uploadAndSave() throws Exception {
@@ -634,4 +743,94 @@ public final class MainActivity extends Activity {
                     .density
         );
     }
+
+    private void registerStatusReceiver() {
+        if (statusReceiverRegistered) {
+            return;
+        }
+
+        IntentFilter filter =
+            new IntentFilter(
+                BackgroundProcessingService
+                    .ACTION_STATUS
+            );
+
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(
+                statusReceiver,
+                filter,
+                Context.RECEIVER_NOT_EXPORTED
+            );
+        } else {
+            registerReceiver(
+                statusReceiver,
+                filter
+            );
+        }
+
+        statusReceiverRegistered = true;
+    }
+
+    private void restoreBackgroundState() {
+        SharedPreferences preferences =
+            getSharedPreferences(
+                "nami_background_state",
+                MODE_PRIVATE
+            );
+
+        boolean running =
+            preferences.getBoolean(
+                "running",
+                false
+            );
+
+        String message =
+            preferences.getString(
+                "message",
+                ""
+            );
+
+        String outputText =
+            preferences.getString(
+                "output_uri",
+                ""
+            );
+
+        if (
+            message != null
+                && !message.isEmpty()
+        ) {
+            statusText.setText(message);
+        }
+
+        if (running) {
+            processing = true;
+            progressBar.setIndeterminate(true);
+            setControlsEnabled(false);
+        } else if (
+            outputText != null
+                && !outputText.isEmpty()
+        ) {
+            processing = false;
+            progressBar.setIndeterminate(false);
+            progressBar.setProgress(100);
+        }
+    }
+
+    @Override
+    protected void onDestroy() {
+        if (statusReceiverRegistered) {
+            try {
+                unregisterReceiver(
+                    statusReceiver
+                );
+            } catch (Exception ignored) {
+            }
+
+            statusReceiverRegistered = false;
+        }
+
+        super.onDestroy();
+    }
+
 }
