@@ -25,7 +25,7 @@ from fastapi import File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
 
-VERSION = "NAMI_V147ZA_FAST_ADAPTIVE_PIPELINE"
+VERSION = "NAMI_V147ZB_FAST_NO_FULL_AUDIO_SYNC"
 MAX_UPLOAD_BYTES = 120 * 1024 * 1024
 
 _PROCESS_LOCK = Lock()
@@ -2167,8 +2167,8 @@ def register_autocap_routes(app) -> None:
             "watermark_rejection_after_band_scan": True,
             "ocr_frame_interval_seconds": 1.0,
             "ocr_group_max_gap_seconds": 1.6,
-            "subtitle_timing_source": "chinese_speech",
-            "dubbing_timing_source": "chinese_speech",
+            "subtitle_timing_source": "ocr_caption_timeline_fast",
+            "dubbing_timing_source": "ocr_caption_timeline_fast",
             "translation_source_policy": "stabilized_ocr_only",
             "ocr_whisper_crosscheck": False,
             "mismatched_ocr_replacement": False,
@@ -2217,6 +2217,11 @@ def register_autocap_routes(app) -> None:
             "tts_concurrency": 6,
             "voice_mix_batch_size": 24,
             "stage_timing_metrics": True,
+            "full_video_whisper_sync": False,
+            "ocr_timing_used_directly": True,
+            "whisper_only_for_sparse_ocr": True,
+            "sparse_ocr_audio_sync_threshold": 4,
+            "fast_audio_sync_skip": True,
             "voices": {
                 "female": "vi-VN-HoaiMyNeural",
                 "male": "vi-VN-NamMinhNeural",
@@ -2605,13 +2610,23 @@ def register_autocap_routes(app) -> None:
                         ),
                     )
 
-                # V147I:
-                # OCR chỉ quyết định nội dung chữ Trung.
-                # Tiếng nói Trung quyết định thời điểm bắt đầu/kết thúc.
+                # V147ZB FAST:
+                # Khi OCR đã đọc được đủ phụ đề, dùng trực tiếp
+                # thời gian xuất hiện của phụ đề. Không chạy
+                # Whisper nghe lại toàn bộ video chỉ để căn giờ.
+                #
+                # Whisper/speech sync chỉ được dùng cứu hộ khi
+                # OCR có rất ít câu nhưng vẫn chưa rơi vào nhánh
+                # nhận dạng âm thanh toàn phần ở phía trên.
+                audio_sync_used = False
+
                 if (
                     recognition_source == "ocr"
+                    and len(items) < 4
                     and _video_has_audio(input_path)
                 ):
+                    sync_started = time.perf_counter()
+
                     _extract_audio_for_sync(
                         input_path,
                         audio_path,
@@ -2630,6 +2645,23 @@ def register_autocap_routes(app) -> None:
                                 speech_windows,
                             )
                         )
+
+                        audio_sync_used = True
+
+                    print(
+                        "NAMI_TIMING optional_audio_sync_seconds="
+                        + f"{time.perf_counter() - sync_started:.3f}"
+                        + " used="
+                        + str(audio_sync_used).lower(),
+                        flush=True,
+                    )
+                else:
+                    print(
+                        "NAMI_FAST_AUDIO_SYNC_SKIPPED=true"
+                        + " ocr_items="
+                        + str(len(items)),
+                        flush=True,
+                    )
 
                 # V147M:
                 # OCR ổn định quyết định nội dung cần dịch.
