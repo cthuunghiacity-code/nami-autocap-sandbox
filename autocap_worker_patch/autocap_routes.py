@@ -23,9 +23,10 @@ import edge_tts
 from fastapi import File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from faster_whisper import WhisperModel
-from transformers import pipeline
+import ctranslate2
+from transformers import AutoTokenizer
 
-VERSION = "NAMI_V147ZC_LOCAL_CHINESE_VIETNAMESE_TRANSLATION"
+VERSION = "NAMI_V147ZD_CTRANSLATE2_INT8_LOCAL_TRANSLATION"
 MAX_UPLOAD_BYTES = 120 * 1024 * 1024
 
 _PROCESS_LOCK = Lock()
@@ -33,10 +34,20 @@ _MODEL_LOCK = Lock()
 _WHISPER_MODEL = None
 
 _LOCAL_TRANSLATOR = None
+_LOCAL_TOKENIZER = None
 _LOCAL_TRANSLATOR_LOCK = Lock()
 _LOCAL_TRANSLATION_CACHE: dict[str, str] = {}
-_LOCAL_TRANSLATION_MODEL = (
+
+_LOCAL_TRANSLATION_MODEL_NAME = (
     "Helsinki-NLP/opus-mt-zh-vi"
+)
+
+_LOCAL_CT2_MODEL_DIR = Path(
+    "/opt/nami_models/opus-mt-zh-vi-ct2"
+)
+
+_LOCAL_TOKENIZER_DIR = Path(
+    "/opt/nami_models/opus-mt-zh-vi-tokenizer"
 )
 
 
@@ -59,27 +70,53 @@ def _load_whisper():
 
 def _load_local_translator():
     global _LOCAL_TRANSLATOR
+    global _LOCAL_TOKENIZER
 
     with _LOCAL_TRANSLATOR_LOCK:
         if _LOCAL_TRANSLATOR is None:
+            if not _LOCAL_CT2_MODEL_DIR.is_dir():
+                raise RuntimeError(
+                    "CT2_MODEL_DIRECTORY_NOT_FOUND: "
+                    + str(_LOCAL_CT2_MODEL_DIR)
+                )
+
+            if not _LOCAL_TOKENIZER_DIR.is_dir():
+                raise RuntimeError(
+                    "TOKENIZER_DIRECTORY_NOT_FOUND: "
+                    + str(_LOCAL_TOKENIZER_DIR)
+                )
+
             started = time.perf_counter()
 
-            _LOCAL_TRANSLATOR = pipeline(
-                "translation",
-                model=_LOCAL_TRANSLATION_MODEL,
-                device=-1,
+            _LOCAL_TRANSLATOR = (
+                ctranslate2.Translator(
+                    str(_LOCAL_CT2_MODEL_DIR),
+                    device="cpu",
+                    compute_type="int8",
+                    inter_threads=1,
+                    intra_threads=2,
+                )
+            )
+
+            _LOCAL_TOKENIZER = (
+                AutoTokenizer.from_pretrained(
+                    str(_LOCAL_TOKENIZER_DIR),
+                    local_files_only=True,
+                )
             )
 
             print(
-                "NAMI_LOCAL_TRANSLATOR_LOADED=true"
-                + " model="
-                + _LOCAL_TRANSLATION_MODEL
+                "NAMI_CT2_TRANSLATOR_LOADED=true"
+                + " compute_type=int8"
                 + " load_seconds="
                 + f"{time.perf_counter() - started:.3f}",
                 flush=True,
             )
 
-    return _LOCAL_TRANSLATOR
+    return (
+        _LOCAL_TRANSLATOR,
+        _LOCAL_TOKENIZER,
+    )
 
 
 def _clean_local_translation(
@@ -756,7 +793,6 @@ def _translate_batch(
         for _ in sources
     ]
 
-    # Chỉ dịch mỗi câu khác nhau một lần.
     unique_pending: list[str] = []
 
     for source in sources:
@@ -764,15 +800,13 @@ def _translate_batch(
             continue
 
         cached = _LOCAL_TRANSLATION_CACHE.get(
-            source
+            source,
+            "",
         )
 
-        if (
-            cached
-            and _translation_is_valid(
-                source,
-                cached,
-            )
+        if _translation_is_valid(
+            source,
+            cached,
         ):
             continue
 
@@ -780,9 +814,10 @@ def _translate_batch(
             unique_pending.append(source)
 
     if unique_pending:
-        translator = _load_local_translator()
+        translator, tokenizer = (
+            _load_local_translator()
+        )
 
-        # Batch nhỏ để giữ RAM ổn định trên CPU Basic.
         local_batch_size = 8
 
         for batch_start in range(
@@ -795,45 +830,74 @@ def _translate_batch(
                 batch_start + local_batch_size
             ]
 
+            token_batches = []
+
+            for source in batch:
+                token_ids = tokenizer.encode(
+                    source,
+                    add_special_tokens=True,
+                    truncation=True,
+                    max_length=256,
+                )
+
+                tokens = (
+                    tokenizer.convert_ids_to_tokens(
+                        token_ids
+                    )
+                )
+
+                token_batches.append(tokens)
+
             started = time.perf_counter()
 
             try:
-                generated = translator(
-                    batch,
-                    max_length=256,
-                    truncation=True,
-                    batch_size=min(
-                        local_batch_size,
-                        len(batch),
-                    ),
+                generated = (
+                    translator.translate_batch(
+                        token_batches,
+                        beam_size=1,
+                        max_decoding_length=256,
+                        repetition_penalty=1.05,
+                    )
                 )
             except Exception as exc:
                 raise RuntimeError(
-                    "LOCAL_TRANSLATION_BATCH_FAILED: "
+                    "CT2_TRANSLATION_BATCH_FAILED: "
                     + str(exc)
                 ) from exc
 
-            if (
-                not isinstance(generated, list)
-                or len(generated) != len(batch)
-            ):
+            if len(generated) != len(batch):
                 raise RuntimeError(
-                    "LOCAL_TRANSLATION_RESULT_COUNT_MISMATCH"
+                    "CT2_TRANSLATION_RESULT_COUNT_MISMATCH"
                 )
 
             for source, result in zip(
                 batch,
                 generated,
             ):
-                if isinstance(result, dict):
-                    translated = (
-                        result.get(
-                            "translation_text",
-                            "",
-                        )
+                if (
+                    not result.hypotheses
+                    or not result.hypotheses[0]
+                ):
+                    raise RuntimeError(
+                        "CT2_TRANSLATION_EMPTY: "
+                        + source
                     )
-                else:
-                    translated = ""
+
+                target_tokens = (
+                    result.hypotheses[0]
+                )
+
+                target_ids = (
+                    tokenizer.convert_tokens_to_ids(
+                        target_tokens
+                    )
+                )
+
+                translated = tokenizer.decode(
+                    target_ids,
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=True,
+                )
 
                 translated = (
                     _clean_local_translation(
@@ -846,8 +910,10 @@ def _translate_batch(
                     translated,
                 ):
                     raise RuntimeError(
-                        "LOCAL_TRANSLATION_INVALID: "
+                        "CT2_TRANSLATION_INVALID: "
                         + source
+                        + " => "
+                        + translated
                     )
 
                 _LOCAL_TRANSLATION_CACHE[
@@ -855,7 +921,7 @@ def _translate_batch(
                 ] = translated
 
             print(
-                "NAMI_LOCAL_TRANSLATION_BATCH"
+                "NAMI_CT2_TRANSLATION_BATCH"
                 + " items="
                 + str(len(batch))
                 + " seconds="
@@ -863,9 +929,7 @@ def _translate_batch(
                 flush=True,
             )
 
-    for index, source in enumerate(
-        sources
-    ):
+    for index, source in enumerate(sources):
         if not source:
             continue
 
@@ -881,7 +945,7 @@ def _translate_batch(
             translated,
         ):
             raise RuntimeError(
-                "LOCAL_TRANSLATION_MISSING: "
+                "CT2_TRANSLATION_MISSING: "
                 + source
             )
 
@@ -2255,13 +2319,18 @@ def register_autocap_routes(app) -> None:
             "whisper_only_for_sparse_ocr": True,
             "sparse_ocr_audio_sync_threshold": 4,
             "fast_audio_sync_skip": True,
-            "translation_engine": "local_opus_mt_zh_vi",
+            "translation_engine": "ctranslate2_int8_opus_mt_zh_vi",
             "google_translate_enabled": False,
             "deep_translator_enabled": False,
             "translation_network_required": False,
-            "local_translation_model": "Helsinki-NLP/opus-mt-zh-vi",
+            "local_translation_model": "Helsinki-NLP/opus-mt-zh-vi-ct2-int8",
             "local_translation_batch_size": 8,
             "local_translation_cache": True,
+            "translation_runtime": "ctranslate2",
+            "translation_compute_type": "int8",
+            "torch_runtime_enabled": False,
+            "model_download_during_request": False,
+            "model_embedded_in_container": True,
             "translation_retry_sleep_seconds": 0,
             "voices": {
                 "female": "vi-VN-HoaiMyNeural",
