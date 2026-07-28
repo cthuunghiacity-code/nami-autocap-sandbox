@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - main
+    paths:
+      - "autocap_worker_patch/**"
+      - ".github/workflows/patch-existing-autocap-worker.yml"
   workflow_dispatch:
 
 permissions:
@@ -12,7 +15,7 @@ permissions:
 jobs:
   patch-worker:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 45
 
     steps:
       - name: Checkout source
@@ -21,9 +24,34 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
-      - name: Upload AutoCap extension safely
+      - name: Validate source files
+        run: |
+          set -euo pipefail
+
+          test -s autocap_worker_patch/app.py
+          test -s autocap_worker_patch/autocap_routes.py
+          test -s autocap_worker_patch/requirements.txt
+          test -s autocap_worker_patch/Dockerfile
+
+          python -m py_compile \
+            autocap_worker_patch/app.py \
+            autocap_worker_patch/autocap_routes.py
+
+          EXPECTED_VERSION="$(
+            grep -E '^VERSION = "' \
+              autocap_worker_patch/autocap_routes.py |
+            head -n 1 |
+            cut -d'"' -f2
+          )"
+
+          test -n "$EXPECTED_VERSION"
+
+          echo "EXPECTED_VERSION=$EXPECTED_VERSION"
+          echo "SOURCE_VALIDATION=PASS"
+
+      - name: Upload AutoCap worker files
         env:
           HF_TOKEN_B64: ${{ secrets.NAMI_HF_TOKEN_B64 }}
           AUTOCAP_KEY_B64: ${{ secrets.NAMI_AUTOCAP_KEY_B64 }}
@@ -51,82 +79,92 @@ jobs:
             --no-input \
             huggingface_hub
 
-          python - <<'PY'
-          import os
-          from huggingface_hub import CommitOperationAdd, HfApi
+          cat > /tmp/upload_space.py <<'PY'
+import os
 
-          repo_id = "Cthuunghiacity/nc-ai-money-worker"
-          api = HfApi(token=os.environ["HF_TOKEN"])
+from huggingface_hub import (
+    CommitOperationAdd,
+    HfApi,
+)
 
-          operations = [
-              CommitOperationAdd(
-                  path_in_repo="app.py",
-                  path_or_fileobj="autocap_worker_patch/app.py",
-              ),
-              CommitOperationAdd(
-                  path_in_repo="autocap_routes.py",
-                  path_or_fileobj=(
-                      "autocap_worker_patch/"
-                      "autocap_routes.py"
-                  ),
-              ),
-              CommitOperationAdd(
-                  path_in_repo="requirements.txt",
-                  path_or_fileobj=(
-                      "autocap_worker_patch/"
-                      "requirements.txt"
-                  ),
-              ),
-              CommitOperationAdd(
-                  path_in_repo="Dockerfile",
-                  path_or_fileobj=(
-                      "autocap_worker_patch/"
-                      "Dockerfile"
-                  ),
-              ),
-          ]
+repo_id = "Cthuunghiacity/nc-ai-money-worker"
 
-          api.create_commit(
-              repo_id=repo_id,
-              repo_type="space",
-              operations=operations,
-              commit_message=(
-                  "add isolated NAMI AutoCap routes V147B2"
-              ),
-          )
+api = HfApi(
+    token=os.environ["HF_TOKEN"],
+)
 
-          api.add_space_secret(
-              repo_id=repo_id,
-              key="NAMI_AUTOCAP_KEY",
-              value=os.environ["AUTOCAP_KEY"],
-          )
+operations = [
+    CommitOperationAdd(
+        path_in_repo="app.py",
+        path_or_fileobj=(
+            "autocap_worker_patch/app.py"
+        ),
+    ),
+    CommitOperationAdd(
+        path_in_repo="autocap_routes.py",
+        path_or_fileobj=(
+            "autocap_worker_patch/"
+            "autocap_routes.py"
+        ),
+    ),
+    CommitOperationAdd(
+        path_in_repo="requirements.txt",
+        path_or_fileobj=(
+            "autocap_worker_patch/"
+            "requirements.txt"
+        ),
+    ),
+    CommitOperationAdd(
+        path_in_repo="Dockerfile",
+        path_or_fileobj=(
+            "autocap_worker_patch/"
+            "Dockerfile"
+        ),
+    ),
+]
 
-          print("EXISTING_ROUTES_PRESERVED=true")
-          print("AUTOCAP_MODULE_UPLOADED=PASS")
-          print("AUTOCAP_SECRET_CONFIGURED=PASS")
-          PY
+result = api.create_commit(
+    repo_id=repo_id,
+    repo_type="space",
+    operations=operations,
+    commit_message=(
+        "deploy NAMI AutoCap worker"
+    ),
+)
 
-      - name: Wait for rebuilt worker
-        env:
-          AUTOCAP_KEY_B64: ${{ secrets.NAMI_AUTOCAP_KEY_B64 }}
+api.add_space_secret(
+    repo_id=repo_id,
+    key="NAMI_AUTOCAP_KEY",
+    value=os.environ["AUTOCAP_KEY"],
+)
+
+print(
+    "HF_COMMIT_URL="
+    + str(result.commit_url)
+)
+print("AUTOCAP_MODULE_UPLOADED=PASS")
+print("AUTOCAP_SECRET_CONFIGURED=PASS")
+PY
+
+          python /tmp/upload_space.py
+
+      - name: Wait for exact worker version
         run: |
           set -euo pipefail
 
           BASE="https://cthuunghiacity-nc-ai-money-worker.hf.space"
 
-          for attempt in $(seq 1 90); do
-            echo "ATTEMPT=$attempt"
+          EXPECTED_VERSION="$(
+            grep -E '^VERSION = "' \
+              autocap_worker_patch/autocap_routes.py |
+            head -n 1 |
+            cut -d'"' -f2
+          )"
 
-            OLD_STATUS="$(
-              curl \
-                --silent \
-                --output /tmp/old-health.json \
-                --write-out '%{http_code}' \
-                --max-time 30 \
-                "$BASE/health" || true
-            )"
+          echo "EXPECTED_VERSION=$EXPECTED_VERSION"
 
-            NEW_STATUS="$(
+          for attempt in $(seq 1 120); do
+            HTTP_CODE="$(
               curl \
                 --silent \
                 --output /tmp/autocap-health.json \
@@ -135,17 +173,16 @@ jobs:
                 "$BASE/autocap/health" || true
             )"
 
-            echo "OLD_HEALTH_STATUS=$OLD_STATUS"
-            echo "AUTOCAP_HEALTH_STATUS=$NEW_STATUS"
-
             ACTUAL_VERSION="$(
               python -c '
 import json
 from pathlib import Path
+
 try:
     data = json.loads(
-        Path("/tmp/autocap-health.json")
-        .read_text()
+        Path(
+            "/tmp/autocap-health.json"
+        ).read_text()
     )
     print(data.get("version", ""))
 except Exception:
@@ -153,31 +190,20 @@ except Exception:
 '
             )"
 
-            echo "ACTUAL_VERSION=$ACTUAL_VERSION"
+            echo \
+              "ATTEMPT=$attempt" \
+              "HTTP_CODE=$HTTP_CODE" \
+              "ACTUAL_VERSION=$ACTUAL_VERSION"
 
-            EXPECTED_VERSION="$(
-              grep -E '^VERSION = ' autocap_worker_patch/autocap_routes.py |
-              head -n 1 |
-              sed -E 's/^VERSION = "([^"]+)"/\1/'
-            )"
-
-            echo "EXPECTED_VERSION=$EXPECTED_VERSION"
-
-            if (
-              [ "$OLD_STATUS" = "200" ] &&
-              [ "$NEW_STATUS" = "200" ] &&
+            if \
+              [ "$HTTP_CODE" = "200" ] && \
               [ "$ACTUAL_VERSION" = "$EXPECTED_VERSION" ]
-            ); then
-              cat /tmp/old-health.json
-              echo
+            then
               cat /tmp/autocap-health.json
               echo
-              echo "OLD_WORKER_HEALTH_PRESERVED=PASS"
               echo "AUTOCAP_EXPECTED_VERSION=PASS"
               exit 0
             fi
-
-            echo "WORKER_NOT_ON_EXPECTED_VERSION_YET"
 
             sleep 20
           done
