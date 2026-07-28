@@ -1,6 +1,9 @@
 name: Patch Existing NAMI Worker With AutoCap
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
